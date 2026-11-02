@@ -45,9 +45,14 @@ public sealed class SpoolWriterTests
         Assert.Empty(writer.ReadManifests());
     }
 
-    private static SpoolWriter Writer(string spool, bool enabled, long maximumBytes = 67_108_864) =>
-        new(new MonitoringOptions("garage-01", spool, 20),
-            new CaptureWriterOptions(enabled, 5, 120, maximumBytes));
+    private static SpoolWriter Writer(string spool, bool enabled, long maximumBytes = 67_108_864)
+    {
+        var monitoring = new MonitoringOptions("garage-01", spool, 20);
+        var options = new CaptureWriterOptions(enabled, 5, 120, maximumBytes);
+        var settings = new CaptureSettingsStore(monitoring, options,
+            new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build());
+        return new SpoolWriter(monitoring, settings);
+    }
 
     private sealed class TempSpool : IDisposable
     {

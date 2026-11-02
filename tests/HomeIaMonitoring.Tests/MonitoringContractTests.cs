@@ -93,6 +93,45 @@ public sealed class MonitoringContractTests
         }
     }
 
+    [Fact]
+    public async Task Capture_endpoint_exposes_effective_disabled_settings()
+    {
+        using var spool = new TempSpool();
+        await using var factory = Factory(spool.Path);
+        using var client = factory.CreateClient();
+        using var response = await client.GetAsync("/api/v1/monitoring/capture");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.False(json.RootElement.GetProperty("enabled").GetBoolean());
+        Assert.Equal("synthetic", json.RootElement.GetProperty("profile").GetString());
+        Assert.Equal("garage-01", json.RootElement.GetProperty("cameraId").GetString());
+        Assert.NotEqual("capturing", json.RootElement.GetProperty("status").GetProperty("state").GetString());
+    }
+
+    [Fact]
+    public async Task Capture_settings_update_is_validated_and_persisted()
+    {
+        using var spool = new TempSpool();
+        await using var factory = Factory(spool.Path);
+        using var client = factory.CreateClient();
+        using var invalid = await client.PutAsJsonAsync("/api/v1/monitoring/capture/settings",
+            new { enabled = true, segmentSeconds = 0, maximumSegments = 10, maximumSegmentBytes = 1_048_576 });
+        Assert.Equal(HttpStatusCode.BadRequest, invalid.StatusCode);
+
+        using var valid = await client.PutAsJsonAsync("/api/v1/monitoring/capture/settings",
+            new { enabled = true, segmentSeconds = 2, maximumSegments = 20, maximumSegmentBytes = 2_097_152 });
+        Assert.Equal(HttpStatusCode.OK, valid.StatusCode);
+        using var json = JsonDocument.Parse(await valid.Content.ReadAsStringAsync());
+        Assert.True(json.RootElement.GetProperty("enabled").GetBoolean());
+        Assert.Equal(2, json.RootElement.GetProperty("segmentSeconds").GetInt32());
+        Assert.Equal(1, json.RootElement.GetProperty("revision").GetInt64());
+        Assert.True(File.Exists(System.IO.Path.Combine(spool.Path, "capture-settings.json")));
+
+        using var contract = await client.GetAsync("/api/v1/monitoring/contract");
+        using var contractJson = JsonDocument.Parse(await contract.Content.ReadAsStringAsync());
+        Assert.Equal("capture-enabled", contractJson.RootElement.GetProperty("executionMode").GetString());
+    }
+
     private static WebApplicationFactory<Program> Factory(string spool, int staleSeconds = 60) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
             builder.ConfigureAppConfiguration((_, configuration) =>

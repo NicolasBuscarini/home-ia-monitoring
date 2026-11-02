@@ -1,6 +1,6 @@
 # Inventário de migração — T16-C
 
-Este inventário orienta a extração do runtime de Monitoramento do monólito `garage-watch-platform` para `home-ia-monitoring`. O estado atual é `contract-only`; nenhum item abaixo foi movido ainda.
+Este inventário orienta a extração do runtime de Monitoramento do monólito `garage-watch-platform` para `home-ia-monitoring`. O serviço já possui contrato, status de câmera, `SpoolWriter` e runtime de captura segmentada; HLS, clipes, eventos, IA e dados ainda pertencem ao monólito.
 
 ## Propriedade alvo
 
@@ -26,10 +26,10 @@ Este inventário orienta a extração do runtime de Monitoramento do monólito `
 
 1. **T16-C-A:** contrato HTTP/health, service skeleton, root commands e inventário. Monólito continua autoridade.
 2. **T16-C-B-A:** read model de status de câmera lendo manifests/gaps do spool; portal usa `MONITORING_STATUS_SOURCE=local|remote`; default local. O writer ainda é o monólito.
-3. **T16-C-B-B-A (esta):** extrair `SpoolWriter` com escrita atômica de segmento/manifesto e limites, desativado por `MONITORING_CAPTURE_ENABLED=false`; sem hosted capture service/adaptador. O monólito continua writer ativo.
-4. **T16-C-B-B-B:** adicionar hosted capture service/adaptador, ativar o writer no serviço, cortar a captura local por feature flag e reconciliar spool/HLS com rollback.
-3. **T16-C-C:** mover clipes/thumbnails/eventos/análise e jobs, com migração aditiva e reconciliação.
-4. **T16-C-D:** mover retenção/arquivo/roster/biometria, validar autorização serviço-a-serviço e executar corte final.
+3. **T16-C-B-B-A:** extrair `SpoolWriter` com escrita atômica de segmento/manifesto e limites, desativado por `MONITORING_CAPTURE_ENABLED=false`; sem hosted capture service/adaptador. O monólito continua writer ativo.
+4. **T16-C-B-B-B (esta):** hosted capture service com adaptadores `synthetic`/`ffmpeg-rtsp`, gaps, retenção, recuperação e settings persistidos; Platform corta a captura local por `CAPTURE_AUTHORITY=remote` e lê o mesmo spool/HLS. Rollback restaura `local`.
+5. **T16-C-C:** mover clipes/thumbnails/eventos/análise e jobs, com migração aditiva e reconciliação.
+6. **T16-C-D:** mover retenção/arquivo/roster/biometria, validar autorização serviço-a-serviço e executar corte final.
 
 ## Regras de migração e rollback
 

@@ -51,7 +51,10 @@ public sealed record SegmentManifestV1(
     long SizeBytes,
     string Sha256);
 
-public sealed class SpoolWriter(MonitoringOptions monitoring, CaptureWriterOptions options)
+public sealed record CaptureGapV1(string SchemaVersion, string GapId, string CameraId,
+    string? PreviousStreamEpoch, DateTimeOffset OccurredAt, string ReasonCode, int RetryAttempt);
+
+public sealed class SpoolWriter(MonitoringOptions monitoring, CaptureSettingsStore settings)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly string _manifestDirectory = Path.Combine(monitoring.SpoolDirectory, "manifests");
@@ -60,7 +63,8 @@ public sealed class SpoolWriter(MonitoringOptions monitoring, CaptureWriterOptio
     public async Task<SegmentManifestV1> StoreAsync(Stream source, DateTimeOffset startedAt,
         DateTimeOffset endedAt, string streamEpoch, CancellationToken cancellationToken = default)
     {
-        if (!options.Enabled)
+        var current = settings.Current;
+        if (!current.Enabled)
             throw new InvalidOperationException("capture_writer_disabled");
         if (endedAt < startedAt) throw new InvalidDataException("capture_segment_invalid");
         Directory.CreateDirectory(_manifestDirectory);
@@ -85,7 +89,7 @@ public sealed class SpoolWriter(MonitoringOptions monitoring, CaptureWriterOptio
                 while ((read = await source.ReadAsync(buffer, cancellationToken)) > 0)
                 {
                     copied += read;
-                    if (copied > options.MaximumSegmentBytes)
+                    if (copied > current.MaximumSegmentBytes)
                         throw new InvalidDataException("capture_segment_size_limit");
                     await target.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
                 }
@@ -145,5 +149,139 @@ public sealed class SpoolWriter(MonitoringOptions monitoring, CaptureWriterOptio
             catch (JsonException) { }
         }
         return count;
+    }
+
+    public async Task RecordGapAsync(string? previousEpoch, int retryAttempt,
+        CancellationToken cancellationToken = default)
+    {
+        var directory = Path.Combine(monitoring.SpoolDirectory, "gaps");
+        Directory.CreateDirectory(directory);
+        var id = Guid.NewGuid().ToString("N");
+        var gap = new CaptureGapV1("1.0", id, monitoring.CameraId, previousEpoch, DateTimeOffset.UtcNow,
+            "capture_source_unavailable", retryAttempt);
+        var temporary = Path.Combine(directory, "gap.pending.tmp");
+        var path = Path.Combine(directory, id + ".json");
+        try
+        {
+            await File.WriteAllTextAsync(temporary, JsonSerializer.Serialize(gap, JsonOptions),
+                cancellationToken);
+            File.Move(temporary, path);
+        }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
+        EnforceGapRetention(directory);
+    }
+
+    public async Task<int> RecoverAsync(CancellationToken cancellationToken = default)
+    {
+        Directory.CreateDirectory(_manifestDirectory);
+        Directory.CreateDirectory(_segmentDirectory);
+        Directory.CreateDirectory(Path.Combine(monitoring.SpoolDirectory, "work"));
+        var gapDirectory = Path.Combine(monitoring.SpoolDirectory, "gaps");
+        Directory.CreateDirectory(gapDirectory);
+        foreach (var temporary in Directory.EnumerateFiles(_segmentDirectory, "*.tmp")) File.Delete(temporary);
+        foreach (var temporary in Directory.EnumerateFiles(_manifestDirectory, "*.tmp")) File.Delete(temporary);
+        foreach (var temporary in Directory.EnumerateFiles(gapDirectory, "*.tmp")) File.Delete(temporary);
+        foreach (var work in Directory.EnumerateDirectories(Path.Combine(monitoring.SpoolDirectory, "work")))
+            Directory.Delete(work, recursive: true);
+
+        var referenced = new HashSet<string>(StringComparer.Ordinal);
+        var valid = 0;
+        foreach (var path in Directory.EnumerateFiles(_manifestDirectory, "*.json"))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var manifestId = Path.GetFileNameWithoutExtension(path);
+            var segmentPath = Path.Combine(_segmentDirectory, manifestId + ".ts");
+            var isValid = false;
+            try
+            {
+                var manifest = JsonSerializer.Deserialize<SegmentManifestV1>(
+                    await File.ReadAllTextAsync(path, cancellationToken), JsonOptions);
+                if (IsValidManifest(manifest, manifestId) && File.Exists(segmentPath) &&
+                    new FileInfo(segmentPath).Length == manifest!.SizeBytes)
+                {
+                    await using var file = File.OpenRead(segmentPath);
+                    var hash = Convert.ToHexString(await SHA256.HashDataAsync(file, cancellationToken))
+                        .ToLowerInvariant();
+                    isValid = hash == manifest.Sha256;
+                }
+            }
+            catch (JsonException) { }
+            if (isValid)
+            {
+                valid++;
+                referenced.Add(manifestId);
+                continue;
+            }
+            if (File.Exists(path)) File.Delete(path);
+            if (IsSafeSegmentId(manifestId) && File.Exists(segmentPath)) File.Delete(segmentPath);
+        }
+        foreach (var segment in Directory.EnumerateFiles(_segmentDirectory, "*.ts"))
+            if (!referenced.Contains(Path.GetFileNameWithoutExtension(segment))) File.Delete(segment);
+        return valid;
+    }
+
+    public int EnforceRetention()
+    {
+        var manifests = Directory.GetFiles(_manifestDirectory, "*.json")
+            .OrderBy(File.GetCreationTimeUtc).ToArray();
+        var pinned = GetPinnedSegmentIds();
+        foreach (var old in manifests.Where(path => !pinned.Contains(Path.GetFileNameWithoutExtension(path)))
+                     .Take(Math.Max(0, manifests.Length - settings.Current.MaximumSegments)))
+        {
+            var segmentId = Path.GetFileNameWithoutExtension(old);
+            try
+            {
+                if (IsSafeSegmentId(segmentId))
+                    File.Delete(Path.Combine(_segmentDirectory, segmentId + ".ts"));
+                File.Delete(old);
+            }
+            catch (IOException) { }
+        }
+        return Directory.GetFiles(_manifestDirectory, "*.json").Length;
+    }
+
+    public bool IsValidManifest(SegmentManifestV1? manifest, string expectedId) =>
+        manifest is { SchemaVersion: "1.0" } && manifest.SegmentId == expectedId &&
+        manifest.CameraId == monitoring.CameraId && IsSafeSegmentId(manifest.SegmentId) &&
+        manifest.FileName == manifest.SegmentId + ".ts" && manifest.SizeBytes is > 0 and <= int.MaxValue &&
+        manifest.SizeBytes <= settings.Current.MaximumSegmentBytes && manifest.Sha256.Length == 64 &&
+        manifest.EndedAt >= manifest.StartedAt;
+
+    public static bool IsSafeSegmentId(string value) =>
+        value.Length == 32 && value.All(Uri.IsHexDigit);
+
+    public IReadOnlySet<string> GetPinnedSegmentIds()
+    {
+        var directory = Path.Combine(monitoring.SpoolDirectory, "clips", "manifests");
+        if (!Directory.Exists(directory)) return new HashSet<string>(StringComparer.Ordinal);
+        var pinned = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var path in Directory.EnumerateFiles(directory, "*.json"))
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(File.ReadAllText(path));
+                var root = document.RootElement;
+                if (!root.TryGetProperty("state", out var state) || state.GetString() != "collecting" ||
+                    !root.TryGetProperty("segmentIds", out var ids) || ids.ValueKind != JsonValueKind.Array)
+                    continue;
+                foreach (var id in ids.EnumerateArray().Select(value => value.GetString()))
+                    if (id is not null && IsSafeSegmentId(id)) pinned.Add(id);
+            }
+            catch (JsonException) { }
+        }
+        return pinned;
+    }
+
+    private void EnforceGapRetention(string directory)
+    {
+        var gaps = Directory.GetFiles(directory, "*.json").OrderBy(File.GetCreationTimeUtc).ToArray();
+        foreach (var old in gaps.Take(Math.Max(0, gaps.Length - settings.Current.MaximumSegments)))
+        {
+            try { File.Delete(old); }
+            catch (IOException) { }
+        }
     }
 }
