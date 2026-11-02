@@ -3,6 +3,9 @@ using HomeIaMonitoring;
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton(provider =>
     MonitoringOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
+builder.Services.AddSingleton(provider =>
+    CaptureWriterOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
+builder.Services.AddSingleton<SpoolWriter>();
 builder.Services.AddSingleton(TimeProvider.System);
 
 var app = builder.Build();

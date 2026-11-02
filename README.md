@@ -10,7 +10,13 @@ Serviço independente do módulo **Monitoramento** do Home IA. Este repositório
 - `GET /api/v1/monitoring/capabilities` — mesma projeção de capabilities.
 - `GET /api/v1/monitoring/cameras/{cameraId}/status` — lê `manifests/` e `gaps/` do spool e reporta `capturing`, `stale`, `unavailable` ou `not_found`; 404 para câmera diferente da configurada.
 
-O serviço não autentica usuários, não decide autorização e não escreve mídia nem inicia captura nesta fase. Ele lê o spool configurado em `MONITORING_SPOOL_DIRECTORY` (default `/spool`) e usa `MONITORING_STATUS_STALE_SECONDS` (default 20) para classificar status. O portal continua sendo a autoridade de sessão/permissão; o serviço receberá decisões de escopo quando o writer for movido.
+O serviço não autentica usuários e não decide autorização. Ele lê o spool configurado em `MONITORING_SPOOL_DIRECTORY` (default `/spool`) e usa `MONITORING_STATUS_STALE_SECONDS` (default 20) para classificar status.
+
+### Writer extraído (desativado por padrão)
+
+`SpoolWriter` já implementa a escrita atômica de segmento + manifesto SHA-256 no layout do spool, com limites de tamanho. `MONITORING_CAPTURE_ENABLED` é `false` por padrão e não há hosted capture service/adaptador FFmpeg ativo nesta fatia; o writer é um componente testado, pronto para a fase de corte. `MONITORING_CAPTURE_SEGMENT_SECONDS`, `MONITORING_CAPTURE_MAX_SEGMENTS` e `MONITORING_CAPTURE_MAX_SEGMENT_BYTES` definem os limites quando ativado.
+
+O portal continua sendo a autoridade de sessão/permissão; a captura ativa ainda é a do monólito. A ativação do writer/cutover exige `T16-C-B-B-B`.
 
 ## Verificações
 
