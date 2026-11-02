@@ -24,8 +24,9 @@ Este inventário orienta a extração do runtime de Monitoramento do monólito `
 
 ## Fases
 
-1. **T16-C-A (esta):** contrato HTTP/health, service skeleton, root commands e inventário. Monólito continua autoridade.
-2. **T16-C-B:** mover captura/spool/HLS e status de câmera; portal consome o serviço por HTTP; feature flag `in-process`/`remote` com rollback.
+1. **T16-C-A:** contrato HTTP/health, service skeleton, root commands e inventário. Monólito continua autoridade.
+2. **T16-C-B-A (esta):** read model de status de câmera lendo manifests/gaps do spool; portal usa `MONITORING_STATUS_SOURCE=local|remote`; default local. O writer ainda é o monólito.
+3. **T16-C-B-B:** mover captura/spool/HLS e o writer de status; portal consome o serviço por HTTP; feature flag `in-process`/`remote` com rollback.
 3. **T16-C-C:** mover clipes/thumbnails/eventos/análise e jobs, com migração aditiva e reconciliação.
 4. **T16-C-D:** mover retenção/arquivo/roster/biometria, validar autorização serviço-a-serviço e executar corte final.
 
