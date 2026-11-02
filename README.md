@@ -12,6 +12,8 @@ Serviço independente do módulo **Monitoramento** do Home IA. Este repositório
 - `GET /api/v1/monitoring/capture` — configuração efetiva (sem RTSP/segredos), revisão e estado do worker.
 - `PUT /api/v1/monitoring/capture/settings` — atualiza `enabled`, `segmentSeconds`, `maximumSegments` e `maximumSegmentBytes` com validação; persiste em `capture-settings.json` no spool e aplica no próximo ciclo.
 
+O painel administrativo do portal consome esses endpoints por proxy autenticado (`/api/v1/admin/monitoring/capture`) e mantém RTSP/credenciais fora da tela. A edição só é liberada no modo remoto (cutover).
+
 O serviço não autentica usuários e não decide autorização. Ele lê/escreve o spool configurado em `MONITORING_SPOOL_DIRECTORY` (default `/spool`) e usa `MONITORING_STATUS_STALE_SECONDS` (default 20) para classificar status. A exposição direta do serviço é apenas para a rede interna; o portal é a autoridade de sessão/permissão.
 
 ## Captura (`T16-C-B-B-B`)
