@@ -1,0 +1,20 @@
+services:
+  verify:
+    image: mcr.microsoft.com/dotnet/sdk:10.0.403@sha256:de4fe90a98845d75910b9769662465c84de1a934665c431279d1382b2bddc02b
+    profiles: [verify]
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - monitoring_service_nuget:/tmp/nuget
+    environment:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "true"
+      NUGET_PACKAGES: /tmp/nuget
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    command: bash -lc 'dotnet restore HomeIaMonitoring.slnx --locked-mode && dotnet format HomeIaMonitoring.slnx --verify-no-changes --no-restore && dotnet test HomeIaMonitoring.slnx --configuration Release --no-restore'
+
+volumes:
+  monitoring_service_nuget:

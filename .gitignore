@@ -1,0 +1,7 @@
+node_modules/
+bin/
+obj/
+.git/
+.env
+.env.*
+!.env.example

@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/HomeIaMonitoring/HomeIaMonitoring.csproj" />
+  <Project Path="tests/HomeIaMonitoring.Tests/HomeIaMonitoring.Tests.csproj" />
+</Solution>
