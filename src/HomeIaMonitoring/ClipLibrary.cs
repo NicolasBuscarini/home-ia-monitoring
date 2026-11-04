@@ -47,7 +47,7 @@ public interface IClipPlaybackSource
 }
 
 public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions capture,
-    AnalysisDispatchStore analysisStore) : IClipPlaybackSource
+    AnalysisDispatchStore analysisStore, RetentionStore retentionStore) : IClipPlaybackSource
 {
     private readonly SemaphoreSlim _conversionGate = new(1, 1);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -55,7 +55,8 @@ public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions cap
 
     public async Task<ClipLibraryPage> ListAsync(IReadOnlyCollection<string> cameraIds, string? publicId,
         DateTimeOffset? fromUtc, DateTimeOffset? toUtc, string? state, int? minDurationSeconds,
-        int? maxDurationSeconds, string? analysis, int page, int pageSize, CancellationToken cancellationToken)
+        int? maxDurationSeconds, string? analysis, bool? preserved, string? sort, int page, int pageSize,
+        CancellationToken cancellationToken)
     {
         if (page is < 1 or > 100_000 || pageSize is < 1 or > 100 ||
             (fromUtc.HasValue && toUtc.HasValue && fromUtc > toUtc) ||
@@ -63,7 +64,9 @@ public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions cap
             (minDurationSeconds.HasValue && maxDurationSeconds.HasValue &&
                 minDurationSeconds > maxDurationSeconds) ||
             (state is not null && !States.Contains(state)) ||
-            (analysis is not null && analysis is not ("performed" or "not_performed")))
+            (analysis is not null && analysis is not ("performed" or "not_performed")) ||
+            (sort is not null && sort is not ("newest" or "oldest" or "longest" or "shortest" or
+                "largest" or "smallest")))
             throw new ArgumentException("invalid_clip_query");
         var allowed = new HashSet<string>(cameraIds, StringComparer.Ordinal);
         if (allowed.Count == 0) return new([], page, pageSize, 0);
@@ -96,10 +99,36 @@ public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions cap
                 ? performed.Contains(clip.PublicId!)
                 : !performed.Contains(clip.PublicId!)).ToList();
         }
-        var ordered = clips.OrderByDescending(clip => clip.EffectiveStartedAt)
-            .ThenBy(clip => clip.ClipId, StringComparer.Ordinal).ToArray();
-        var items = ordered.Skip((page - 1) * pageSize).Take(pageSize).Select(Map).ToArray();
-        return new(items, page, pageSize, ordered.Length);
+        if (preserved is not null)
+        {
+            var states = new Dictionary<string, bool>(StringComparer.Ordinal);
+            foreach (var batch in clips.Select(clip => clip.PublicId!).Chunk(100))
+            {
+                foreach (var preservation in await retentionStore.ListPreservationsAsync(batch, cancellationToken))
+                    states[preservation.ClipPublicId] = preservation.IsPreserved;
+            }
+            clips = clips.Where(clip =>
+                (states.TryGetValue(clip.PublicId!, out var isPreserved) && isPreserved) == preserved.Value)
+                .ToList();
+        }
+        var ordered = sort switch
+        {
+            "oldest" => clips.OrderBy(clip => clip.EffectiveStartedAt)
+                .ThenBy(clip => clip.ClipId, StringComparer.Ordinal),
+            "longest" => clips.OrderByDescending(clip => clip.EffectiveEndedAt - clip.EffectiveStartedAt)
+                .ThenByDescending(clip => clip.EffectiveStartedAt),
+            "shortest" => clips.OrderBy(clip => clip.EffectiveEndedAt - clip.EffectiveStartedAt)
+                .ThenByDescending(clip => clip.EffectiveStartedAt),
+            "largest" => clips.OrderByDescending(MediaSize)
+                .ThenByDescending(clip => clip.EffectiveStartedAt),
+            "smallest" => clips.OrderBy(MediaSize)
+                .ThenByDescending(clip => clip.EffectiveStartedAt),
+            _ => clips.OrderByDescending(clip => clip.EffectiveStartedAt)
+                .ThenBy(clip => clip.ClipId, StringComparer.Ordinal),
+        };
+        var orderedArray = ordered.ToArray();
+        var items = orderedArray.Skip((page - 1) * pageSize).Take(pageSize).Select(Map).ToArray();
+        return new(items, page, pageSize, orderedArray.Length);
     }
 
     public async Task<ClipLibraryItem?> GetAsync(string publicId, CancellationToken cancellationToken)
@@ -276,6 +305,9 @@ public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions cap
         var path = Path.Combine(monitoring.SpoolDirectory, "clips", kind, filename);
         return File.Exists(path) ? path : null;
     }
+
+    private long MediaSize(ClipManifestV1 clip) =>
+        Resolve("media", clip.MediaFileName, clip.MediaSha256) is { } path ? new FileInfo(path).Length : 0;
 
     private ClipLibraryItem Map(ClipManifestV1 clip)
     {

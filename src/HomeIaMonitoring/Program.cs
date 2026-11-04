@@ -101,13 +101,13 @@ app.MapGet("/api/v1/monitoring/cameras/{cameraId}/status", (string cameraId, Mon
 });
 app.MapGet("/api/v1/monitoring/clips",
     async (string[]? cameraIds, string? publicId, DateTimeOffset? fromUtc, DateTimeOffset? toUtc,
-        string? state, int? minDurationSeconds, int? maxDurationSeconds, string? analysis, int? page,
-        int? pageSize, ClipLibrary library, CancellationToken cancellationToken) =>
+        string? state, int? minDurationSeconds, int? maxDurationSeconds, string? analysis, bool? preserved,
+        string? sort, int? page, int? pageSize, ClipLibrary library, CancellationToken cancellationToken) =>
     {
         try
         {
             var result = await library.ListAsync(cameraIds ?? [], publicId, fromUtc, toUtc, state,
-                minDurationSeconds, maxDurationSeconds, analysis, page ?? 1, pageSize ?? 25,
+                minDurationSeconds, maxDurationSeconds, analysis, preserved, sort, page ?? 1, pageSize ?? 25,
                 cancellationToken);
             return Results.Ok(result);
         }
