@@ -3,4 +3,7 @@
     <AssemblyName>HomeIaMonitoring</AssemblyName>
     <RootNamespace>HomeIaMonitoring</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" />
+  </ItemGroup>
 </Project>
