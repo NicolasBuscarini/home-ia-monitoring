@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Text.Json;
 
 namespace HomeIaMonitoring;
 
@@ -234,7 +235,7 @@ public sealed class FfmpegRtspCaptureAdapter(CaptureOptions options) : ISegmentC
     }
 }
 
-internal static class MpegTsStreamValidator
+public static class MpegTsStreamValidator
 {
     public static async Task ValidateAsync(string path, string ffprobePath, bool audioEnabled,
         CancellationToken cancellationToken)
@@ -259,9 +260,19 @@ internal static class MpegTsStreamValidator
         await errorTask;
         if (process.ExitCode != 0)
             throw new InvalidDataException("capture_codec_unsupported");
-        var hasVideo = output.Contains("\"codec_type\":\"video\"", StringComparison.OrdinalIgnoreCase);
-        var hasAudio = output.Contains("\"codec_type\":\"audio\"", StringComparison.OrdinalIgnoreCase);
+        var hasVideo = HasStreamType(output, "video");
+        var hasAudio = HasStreamType(output, "audio");
         if (!hasVideo || (audioEnabled && !hasAudio))
             throw new InvalidDataException(audioEnabled ? "capture_audio_unsupported" : "capture_codec_unsupported");
+    }
+
+    public static bool HasStreamType(string json, string codecType)
+    {
+        using var document = JsonDocument.Parse(json);
+        return document.RootElement.TryGetProperty("streams", out var streams)
+            && streams.ValueKind == JsonValueKind.Array
+            && streams.EnumerateArray().Any(stream =>
+                stream.TryGetProperty("codec_type", out var type)
+                && string.Equals(type.GetString(), codecType, StringComparison.OrdinalIgnoreCase));
     }
 }
