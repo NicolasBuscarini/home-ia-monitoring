@@ -543,7 +543,8 @@ public sealed class ClipRetentionWorker(ArchiveOptions options, ClipArchiveServi
                 var cutoff = timeProvider.GetUtcNow().AddDays(-policy.RetentionDays);
                 var expired = ordered.Where(item => item.EffectiveEndedAt <= cutoff &&
                     !protectedIds.Contains(item.ClipId)).ToList();
-                long total = ordered.Sum(item => item.MediaSizeBytes + item.ThumbnailSizeBytes);
+                long total = ordered.Where(item => !expired.Contains(item))
+                    .Sum(item => item.MediaSizeBytes + item.ThumbnailSizeBytes);
                 if (policy.MaximumStorageBytes is { } maximum)
                     foreach (var entry in ordered)
                     {

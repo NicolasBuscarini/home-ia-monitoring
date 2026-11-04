@@ -96,6 +96,52 @@ public sealed class RetentionTests
     }
 
     [Fact]
+    public async Task Archive_worker_replaces_oldest_eligible_copy_to_make_room_for_new_clip()
+    {
+        using var spool = new TempRetentionSpool();
+        var old = await spool.WriteClipAsync("garage-01", DateTimeOffset.UtcNow.AddDays(-20));
+        await spool.WriteRawPolicyAsync("garage-01", retentionDays: 3650, maximumStorageBytes: 4096);
+        await using var factory = Factory(spool);
+        var archive = factory.Services.GetRequiredService<ClipArchiveService>();
+        Assert.True(await archive.RunOnceAsync(CancellationToken.None));
+
+        var incoming = await spool.WriteClipAsync("garage-01", DateTimeOffset.UtcNow);
+        Assert.True(await archive.RunOnceAsync(CancellationToken.None));
+
+        var worker = factory.Services.GetRequiredService<ClipRetentionWorker>();
+        await worker.RunOnceAsync(CancellationToken.None);
+
+        Assert.False(Directory.Exists(spool.ArchiveDirectory("garage-01", old)));
+        var status = spool.ReadManifest(incoming).GetProperty("archiveStatus").GetString();
+        Assert.True(File.Exists(spool.ArchiveManifest("garage-01", incoming)),
+            $"New archive status was {status}.");
+        Assert.Equal("archived", status);
+    }
+
+    [Fact]
+    public async Task Archive_worker_keeps_new_clip_when_age_expired_copy_already_frees_room()
+    {
+        using var spool = new TempRetentionSpool();
+        var old = await spool.WriteClipAsync("garage-01", DateTimeOffset.UtcNow.AddDays(-10));
+        await spool.WriteRawPolicyAsync("garage-01", retentionDays: 1, maximumStorageBytes: 4096);
+        await using var factory = Factory(spool);
+        var archive = factory.Services.GetRequiredService<ClipArchiveService>();
+        Assert.True(await archive.RunOnceAsync(CancellationToken.None));
+
+        var incoming = await spool.WriteClipAsync("garage-01", DateTimeOffset.UtcNow);
+        Assert.True(await archive.RunOnceAsync(CancellationToken.None));
+
+        var worker = factory.Services.GetRequiredService<ClipRetentionWorker>();
+        await worker.RunOnceAsync(CancellationToken.None);
+
+        Assert.False(Directory.Exists(spool.ArchiveDirectory("garage-01", old)));
+        var status = spool.ReadManifest(incoming).GetProperty("archiveStatus").GetString();
+        Assert.True(File.Exists(spool.ArchiveManifest("garage-01", incoming)),
+            $"New archive status was {status}.");
+        Assert.Equal("archived", status);
+    }
+
+    [Fact]
     public async Task Preservation_requires_an_archived_ready_clip_and_valid_public_id()
     {
         using var spool = new TempRetentionSpool();
@@ -218,6 +264,23 @@ public sealed class RetentionTests
             await File.WriteAllTextAsync(Path.Combine(_manifestDirectory, clipId + ".json"),
                 JsonSerializer.Serialize(manifest, new JsonSerializerOptions(JsonSerializerDefaults.Web)));
             return new ClipStub(clipId, publicId, mediaName, thumbnailName);
+        }
+
+        public async Task WriteRawPolicyAsync(string cameraId, int retentionDays, long maximumStorageBytes)
+        {
+            var directory = Path.Combine(SpoolPath, "retention", "policies");
+            Directory.CreateDirectory(directory);
+            var policy = new
+            {
+                schemaVersion = "1.0",
+                cameraId,
+                retentionDays,
+                maximumStorageBytes,
+                version = 1,
+                updatedAtUtc = DateTimeOffset.UtcNow
+            };
+            await File.WriteAllTextAsync(Path.Combine(directory, cameraId + ".json"),
+                JsonSerializer.Serialize(policy, new JsonSerializerOptions(JsonSerializerDefaults.Web)));
         }
 
         public void Dispose()
