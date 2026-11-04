@@ -29,6 +29,7 @@ Serviço independente do módulo **Monitoramento** do Home IA. Este repositório
 - `GET /api/v1/monitoring/retention/preservations?clipPublicIds=...` — lê o estado de preservação em lote por IDs públicos de clipe.
 - `PUT /api/v1/monitoring/retention/clips/{clipPublicId}/preservation` — preserva/libera um clipe arquivado com `{expectedVersion, isPreserved}`.
 - `GET /api/v1/monitoring/biometrics/enrollments?userPublicId=...` — lista até 20 inscrições biométricas cifradas do usuário, expirando vencidas sob demanda.
+- `GET /api/v1/monitoring/biometrics/ciphertexts` — exporta somente envelopes ativos (ciphertext/nonce/tag/`keyVersion`/dimensões/modelo/schema) para o matching no portal; token de serviço, sem chave ou plaintext.
 - `GET /api/v1/monitoring/biometrics/enrollments/{publicId}` — lê o resumo de uma inscrição sem devolver ciphertext.
 - `POST /api/v1/monitoring/biometrics/enrollments` — recebe apenas `{userPublicId, embeddingCiphertext/Nonce/Tag, keyVersion, dimensions, modelId, modelVersion, embeddingSchemaVersion, adapterId, consentVersion}` e revoga a anterior ativa.
 - `DELETE /api/v1/monitoring/biometrics/enrollments/{publicId}?reason=owner_request|administrator_request` — revoga e apaga o payload cifrado, mantendo tombstone versionado.

@@ -244,6 +244,9 @@ app.MapGet("/api/v1/monitoring/biometrics/enrollments",
             return Results.BadRequest(new { error = "invalid_biometric_query", detail = exception.Message });
         }
     });
+app.MapGet("/api/v1/monitoring/biometrics/ciphertexts",
+    async (BiometricStore store, CancellationToken cancellationToken) =>
+        Results.Ok(await store.ListActiveCiphertextsAsync(cancellationToken)));
 app.MapGet("/api/v1/monitoring/biometrics/enrollments/{publicId}",
     async (string publicId, BiometricStore store, CancellationToken cancellationToken) =>
     {

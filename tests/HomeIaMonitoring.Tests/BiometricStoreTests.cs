@@ -171,6 +171,37 @@ public sealed class BiometricStoreTests
         Assert.Equal(JsonValueKind.Null, stored.RootElement.GetProperty("embeddingCiphertext").ValueKind);
     }
 
+    [Fact]
+    public async Task Active_ciphertext_endpoint_exposes_only_the_active_encrypted_payload()
+    {
+        using var spool = new TempSpool();
+        await using var factory = Factory(spool.Path);
+        using var client = factory.CreateClient();
+        var first = await Enroll(client);
+        var second = await Enroll(client);
+
+        var envelopes = await client.GetFromJsonAsync<BiometricCiphertextEnvelope[]>(
+            "/api/v1/monitoring/biometrics/ciphertexts");
+        Assert.NotNull(envelopes);
+        var active = Assert.Single(envelopes);
+        Assert.Equal(second.Enrollment.PublicId, active.PublicId);
+        Assert.NotEqual(first.Enrollment.PublicId, active.PublicId);
+        Assert.Equal(128, active.EmbeddingCiphertext.Length);
+        Assert.Equal(12, active.EmbeddingNonce.Length);
+        Assert.Equal(16, active.EmbeddingTag.Length);
+        Assert.Equal("v1", active.KeyVersion);
+        Assert.Equal(128, active.Dimensions);
+        Assert.Equal("opencv-zoo-sface", active.ModelId);
+        Assert.Equal("1.0", active.EmbeddingSchemaVersion);
+
+        await client.DeleteAsync($"/api/v1/monitoring/biometrics/enrollments/{active.PublicId}" +
+            "?reason=owner_request");
+        var afterRevoke = await client.GetFromJsonAsync<BiometricCiphertextEnvelope[]>(
+            "/api/v1/monitoring/biometrics/ciphertexts");
+        Assert.NotNull(afterRevoke);
+        Assert.Empty(afterRevoke);
+    }
+
     private static BiometricEnrollmentRequest Request() => new(
         User,
         Enumerable.Range(0, 128).Select(value => (byte)value).ToArray(),

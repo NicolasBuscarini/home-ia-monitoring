@@ -70,6 +70,20 @@ public sealed record BiometricEnrollmentResult(
 public sealed class BiometricEnrollmentNotFoundException(string publicId)
     : Exception($"biometric_enrollment_not_found:{publicId}");
 
+public sealed record BiometricCiphertextEnvelope(
+    string PublicId,
+    byte[] EmbeddingCiphertext,
+    byte[] EmbeddingNonce,
+    byte[] EmbeddingTag,
+    string KeyVersion,
+    int Dimensions,
+    string ModelId,
+    string ModelVersion,
+    string EmbeddingSchemaVersion,
+    DateTimeOffset EnrolledAtUtc,
+    DateTimeOffset ExpiresAtUtc,
+    long Version);
+
 /// <summary>
 /// Owns the operational encrypted biometric registry under the monitoring spool. Identity,
 /// authorization, consent text, extraction/protection and audit remain in the portal; this store
@@ -104,6 +118,30 @@ public sealed class BiometricStore(MonitoringOptions monitoring, TimeProvider ti
                 .ThenBy(item => item.PublicId, StringComparer.Ordinal)
                 .Take(20)
                 .Select(ToSummary)
+                .ToList();
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Returns only active ciphertext envelopes for the portal's matching boundary. The service never
+    /// sees the key or plaintext; this is a service-to-service, read-only export of encrypted payloads.
+    /// </summary>
+    public async Task<IReadOnlyList<BiometricCiphertextEnvelope>> ListActiveCiphertextsAsync(
+        CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            await EnsureLoadedUnderLockAsync(cancellationToken);
+            await ExpireDueUnderLockAsync(cancellationToken);
+            return _enrollments.Values
+                .Where(item => item.Status == BiometricEnrollmentV1.ActiveStatus && item.HasPayload)
+                .OrderBy(item => item.PublicId, StringComparer.Ordinal)
+                .Select(item => new BiometricCiphertextEnvelope(item.PublicId,
+                    item.EmbeddingCiphertext!, item.EmbeddingNonce!, item.EmbeddingTag!,
+                    item.KeyVersion, item.Dimensions, item.ModelId, item.ModelVersion,
+                    item.EmbeddingSchemaVersion, item.EnrolledAtUtc, item.ExpiresAtUtc, item.Version))
                 .ToList();
         }
         finally { _gate.Release(); }
