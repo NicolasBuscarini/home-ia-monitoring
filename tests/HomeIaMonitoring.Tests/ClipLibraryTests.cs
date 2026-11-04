@@ -31,6 +31,17 @@ public sealed class ClipLibraryTests
         Assert.Single(page.Items);
         Assert.Equal(newer.PublicId, page.Items[0].PublicId);
 
+        using var byId = await client.GetAsync(
+            $"/api/v1/monitoring/clips?cameraIds=garage-01&publicId={newer.PublicId}");
+        var byIdPage = await byId.Content.ReadFromJsonAsync<ClipLibraryPage>();
+        Assert.Single(byIdPage!.Items);
+        Assert.Equal(newer.PublicId, byIdPage.Items[0].PublicId);
+
+        using var tooLong = await client.GetAsync(
+            "/api/v1/monitoring/clips?cameraIds=garage-01&minDurationSeconds=11");
+        var tooLongPage = await tooLong.Content.ReadFromJsonAsync<ClipLibraryPage>();
+        Assert.Empty(tooLongPage!.Items);
+
         using var other = await client.GetAsync("/api/v1/monitoring/clips?cameraIds=side-entry");
         var otherPage = await other.Content.ReadFromJsonAsync<ClipLibraryPage>();
         Assert.Single(otherPage!.Items);
@@ -44,6 +55,12 @@ public sealed class ClipLibraryTests
             (await client.GetAsync("/api/v1/monitoring/clips?cameraIds=garage-01&page=0")).StatusCode);
         Assert.Equal(HttpStatusCode.BadRequest,
             (await client.GetAsync("/api/v1/monitoring/clips?cameraIds=garage-01&state=unknown")).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest,
+            (await client.GetAsync("/api/v1/monitoring/clips?cameraIds=garage-01&analysis=unknown")).StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest,
+            (await client.GetAsync(
+                "/api/v1/monitoring/clips?cameraIds=garage-01&minDurationSeconds=10&maxDurationSeconds=5"))
+                .StatusCode);
     }
 
     [Fact]

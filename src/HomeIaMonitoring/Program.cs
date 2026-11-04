@@ -100,13 +100,15 @@ app.MapGet("/api/v1/monitoring/cameras/{cameraId}/status", (string cameraId, Mon
         : StatusCodes.Status200OK);
 });
 app.MapGet("/api/v1/monitoring/clips",
-    async (string[]? cameraIds, DateTimeOffset? fromUtc, DateTimeOffset? toUtc, string? state, int? page,
+    async (string[]? cameraIds, string? publicId, DateTimeOffset? fromUtc, DateTimeOffset? toUtc,
+        string? state, int? minDurationSeconds, int? maxDurationSeconds, string? analysis, int? page,
         int? pageSize, ClipLibrary library, CancellationToken cancellationToken) =>
     {
         try
         {
-            var result = await library.ListAsync(cameraIds ?? [], fromUtc, toUtc, state, page ?? 1,
-                pageSize ?? 25, cancellationToken);
+            var result = await library.ListAsync(cameraIds ?? [], publicId, fromUtc, toUtc, state,
+                minDurationSeconds, maxDurationSeconds, analysis, page ?? 1, pageSize ?? 25,
+                cancellationToken);
             return Results.Ok(result);
         }
         catch (ArgumentException exception)

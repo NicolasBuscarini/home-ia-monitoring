@@ -46,18 +46,24 @@ public interface IClipPlaybackSource
     Task<string?> GetPlaybackPathAsync(string publicId, CancellationToken cancellationToken);
 }
 
-public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions capture) : IClipPlaybackSource
+public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions capture,
+    AnalysisDispatchStore analysisStore) : IClipPlaybackSource
 {
     private readonly SemaphoreSlim _conversionGate = new(1, 1);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly string[] States = ["collecting", "ready", "failed", "lost_capacity"];
 
-    public async Task<ClipLibraryPage> ListAsync(IReadOnlyCollection<string> cameraIds, DateTimeOffset? fromUtc,
-        DateTimeOffset? toUtc, string? state, int page, int pageSize, CancellationToken cancellationToken)
+    public async Task<ClipLibraryPage> ListAsync(IReadOnlyCollection<string> cameraIds, string? publicId,
+        DateTimeOffset? fromUtc, DateTimeOffset? toUtc, string? state, int? minDurationSeconds,
+        int? maxDurationSeconds, string? analysis, int page, int pageSize, CancellationToken cancellationToken)
     {
         if (page is < 1 or > 100_000 || pageSize is < 1 or > 100 ||
             (fromUtc.HasValue && toUtc.HasValue && fromUtc > toUtc) ||
-            (state is not null && !States.Contains(state)))
+            (minDurationSeconds is < 0 or > 86_400) || (maxDurationSeconds is < 0 or > 86_400) ||
+            (minDurationSeconds.HasValue && maxDurationSeconds.HasValue &&
+                minDurationSeconds > maxDurationSeconds) ||
+            (state is not null && !States.Contains(state)) ||
+            (analysis is not null && analysis is not ("performed" or "not_performed")))
             throw new ArgumentException("invalid_clip_query");
         var allowed = new HashSet<string>(cameraIds, StringComparer.Ordinal);
         if (allowed.Count == 0) return new([], page, pageSize, 0);
@@ -67,10 +73,28 @@ public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions cap
             cancellationToken.ThrowIfCancellationRequested();
             var clip = await ReadManifestAsync(path, cancellationToken);
             if (clip is null || !allowed.Contains(clip.CameraId) ||
+                (publicId is not null && clip.PublicId != publicId) ||
                 (fromUtc.HasValue && clip.EffectiveEndedAt < fromUtc) ||
-                (toUtc.HasValue && clip.EffectiveStartedAt > toUtc) || (state is not null && clip.State != state))
+                (toUtc.HasValue && clip.EffectiveStartedAt > toUtc) ||
+                (state is not null && clip.State != state))
+                continue;
+            var duration = (clip.EffectiveEndedAt - clip.EffectiveStartedAt).TotalSeconds;
+            if ((minDurationSeconds.HasValue && duration < minDurationSeconds) ||
+                (maxDurationSeconds.HasValue && duration > maxDurationSeconds))
                 continue;
             clips.Add(clip);
+        }
+        if (analysis is not null)
+        {
+            var performed = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var batch in clips.Select(clip => clip.PublicId!).Chunk(100))
+            {
+                var jobs = await analysisStore.LatestForClipsAsync(batch, cancellationToken);
+                foreach (var job in jobs) performed.Add(job.ClipPublicId);
+            }
+            clips = clips.Where(clip => analysis == "performed"
+                ? performed.Contains(clip.PublicId!)
+                : !performed.Contains(clip.PublicId!)).ToList();
         }
         var ordered = clips.OrderByDescending(clip => clip.EffectiveStartedAt)
             .ThenBy(clip => clip.ClipId, StringComparer.Ordinal).ToArray();
