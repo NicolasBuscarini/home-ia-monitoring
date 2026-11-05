@@ -64,6 +64,7 @@ O serviço não autentica usuários e não decide autorização. Ele lê/escreve
 - Falha de rede, `5xx`, `408` e `429` mantêm o item pendente com tentativa contabilizada; rejeição definitiva ou excesso de `MONITORING_EVENT_OUTBOX_MAX_ATTEMPTS` move para `events/outbox/dead/`. `MONITORING_EVENT_OUTBOX_MAX_EVENTS`/`_MAX_BYTES` descartam o mais antigo e `_MAX_AGE_DAYS` expira pendências, sempre com contador.
 - `GET /api/v1/monitoring/events/outbox` informa profundidade, bytes, enviados, falhas, descartes, dead-letter e última falha. Captura, mídia e HLS nunca esperam o portal.
 - Primeira adoção: `clip.retention.expired` após a remoção confirmada do clipe arquivado.
+- `GET /metrics` expõe a outbox em texto Prometheus (`monitoring_event_outbox_*`: enabled, pending, bytes, enviados/falhas/descartes, dead-letter e último sucesso); é público apenas em loopback/rede interna e não inclui erro em texto livre. O runbook fica em `docs/operacao/21_RUNBOOK_EVENTSTORE.md` no repositório de contexto.
 
 ## Análise (`T16-C-C-B-B-A/B`)
 

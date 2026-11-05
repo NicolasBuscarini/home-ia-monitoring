@@ -404,6 +404,9 @@ app.MapGet("/api/v1/monitoring/events/recovery",
         Results.Ok(await journal.RecoverAsync(cancellationToken)));
 app.MapGet("/api/v1/monitoring/events/outbox",
     (PlatformEventOutbox outbox) => Results.Ok(outbox.GetStatus()));
+app.MapGet("/metrics",
+    (PlatformEventOutbox outbox) =>
+        Results.Text(EventOutboxMetrics.Render(outbox.GetStatus()), EventOutboxMetrics.ContentType));
 app.MapGet("/api/v1/monitoring/analysis/policies/{cameraId}",
     async (string cameraId, AnalysisDispatchStore store, CancellationToken cancellationToken) =>
     {
