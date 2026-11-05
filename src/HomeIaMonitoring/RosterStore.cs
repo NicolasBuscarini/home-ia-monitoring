@@ -38,7 +38,8 @@ public sealed class RosterPersonNotFoundException(string publicId)
 /// Authorization, operator identity and audit remain in the portal; this store only enforces
 /// data integrity and the authorization-confirmation precondition.
 /// </summary>
-public sealed class RosterStore(MonitoringOptions monitoring, TimeProvider timeProvider)
+public sealed class RosterStore(MonitoringOptions monitoring, TimeProvider timeProvider,
+    PlatformEventOutbox? outbox = null)
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -96,6 +97,9 @@ public sealed class RosterStore(MonitoringOptions monitoring, TimeProvider timeP
                 now, now, null, 1);
             await WriteUnderLockAsync(person, cancellationToken);
             _people[publicId] = person;
+            if (outbox is not null)
+                await outbox.EnqueueAsync(new PlatformEventOutboxEvent("roster.person.created",
+                    "administration", "info", "success", "roster_person", publicId), cancellationToken);
             return ToSummary(person);
         }
         finally { _gate.Release(); }
@@ -122,6 +126,9 @@ public sealed class RosterStore(MonitoringOptions monitoring, TimeProvider timeP
             };
             await WriteUnderLockAsync(tombstone, cancellationToken);
             _people[publicId] = tombstone;
+            if (outbox is not null)
+                await outbox.EnqueueAsync(new PlatformEventOutboxEvent("roster.person.removed",
+                    "administration", "warning", "success", "roster_person", publicId), cancellationToken);
         }
         finally { _gate.Release(); }
     }

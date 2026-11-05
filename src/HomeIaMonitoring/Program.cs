@@ -60,13 +60,30 @@ builder.Services.AddSingleton(provider => new PlatformEventOutbox(
     provider.GetRequiredService<PlatformEventOutboxOptions>(), provider.GetRequiredService<TimeProvider>()));
 builder.Services.AddSingleton<PlatformEventOutboxWorker>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<PlatformEventOutboxWorker>());
+builder.Services.AddSingleton(provider =>
+    IdentityObservationOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
+builder.Services.AddSingleton<IFaceObservationSource>(provider =>
+    provider.GetRequiredService<IdentityObservationOptions>().Source == IdentityObservationOptions.SyntheticSource
+        ? new SyntheticFaceObservationSource()
+        : new DisabledFaceObservationSource());
+builder.Services.AddSingleton(provider => new IdentityObservationProducer(
+    provider.GetRequiredService<IdentityObservationOptions>(),
+    provider.GetRequiredService<IClipPlaybackSource>(),
+    provider.GetRequiredService<IFaceObservationSource>(),
+    provider.GetRequiredService<TimeProvider>(),
+    provider.GetRequiredService<ILogger<IdentityObservationProducer>>()));
+builder.Services.AddHostedService(provider => new IdentityObservationWorker(
+    provider.GetRequiredService<IdentityObservationProducer>(),
+    provider.GetRequiredService<IdentityObservationOptions>(),
+    provider.GetRequiredService<ILogger<IdentityObservationWorker>>()));
 
 var app = builder.Build();
 
 var serviceTokenOptions = app.Services.GetRequiredService<ServiceTokenOptions>();
 app.Use(async (context, next) =>
 {
-    if (serviceTokenOptions.Disabled || context.Request.Path.StartsWithSegments("/health"))
+    if (serviceTokenOptions.Disabled || context.Request.Path.StartsWithSegments("/health")
+        || context.Request.Path.StartsWithSegments("/metrics"))
     {
         await next();
         return;
@@ -404,9 +421,12 @@ app.MapGet("/api/v1/monitoring/events/recovery",
         Results.Ok(await journal.RecoverAsync(cancellationToken)));
 app.MapGet("/api/v1/monitoring/events/outbox",
     (PlatformEventOutbox outbox) => Results.Ok(outbox.GetStatus()));
+app.MapGet("/api/v1/monitoring/identity-observations/status",
+    (IdentityObservationProducer producer) => Results.Ok(producer.GetStatus()));
 app.MapGet("/metrics",
-    (PlatformEventOutbox outbox) =>
-        Results.Text(EventOutboxMetrics.Render(outbox.GetStatus()), EventOutboxMetrics.ContentType));
+    (PlatformEventOutbox outbox, IdentityObservationProducer producer) =>
+        Results.Text(EventOutboxMetrics.Render(outbox.GetStatus()) +
+            IdentityObservationMetrics.Render(producer.GetStatus()), EventOutboxMetrics.ContentType));
 app.MapGet("/api/v1/monitoring/analysis/policies/{cameraId}",
     async (string cameraId, AnalysisDispatchStore store, CancellationToken cancellationToken) =>
     {

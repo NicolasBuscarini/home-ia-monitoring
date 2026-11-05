@@ -38,6 +38,15 @@ Este inventário orienta a extração do runtime de Monitoramento do monólito `
 12. **T16-C-D (parcial):** resta o corte final do monólito com validação serviço-a-serviço; a extração/cifra biométrica ainda roda no portal e o serviço não executa reconhecimento.
 13. **T16-E (concluída no escopo local para HLS e escrita de clipes):** o serviço serve `GET /api/v1/monitoring/live/{cameraId}/index.m3u8` e `.../segments/{segmentId}` a partir de manifests validados, e `POST /api/v1/monitoring/clips/media` materializa mídia/thumbnail idempotentes com SHA-256 (`clips.write`, `live.hls.read`). O portal mantém trigger, autorização, manifesto/estado do clipe e usa `MONITORING_LIVE_SOURCE=local|remote` e `MONITORING_CLIPS_WRITE_SOURCE=local|remote` (default `local`). Como o manifesto e os arquivos continuam no mesmo formato/spool, o rollback é apenas de configuração. O corte final `T16-E` ainda exige validação de spool compartilhado em execução contínua e câmera real.
 
+## Producer de observação de identidade (T09-PRODUCER, 05/11/2026)
+
+- `IDENTITY_OBSERVATION_PRODUCER_ENABLED=false` por padrão; `..._SOURCE=disabled|synthetic` (extração real ainda não existe).
+- Varre clipes `ready` mais recentes, deduplica por `clipPublicId` e limita uma observação por câmera a cada `..._MIN_INTERVAL_SECONDS` (padrão 60).
+- Fila limitada em memória (`..._QUEUE_CAPACITY`, padrão 64): embeddings não são gravados em disco; reinício perde pendências e o descarte é observável.
+- Usa `MONITORING_SERVICE_TOKEN_SECRET` e envia `face-observation.v1` a `IDENTITY_OBSERVATION_PRODUCER_PORTAL_URL/api/v1/monitoring/identity-observations` com escopo `identity.observations.write`.
+- Retry para rede/`408`/`429`/`5xx`; `4xx` definitivo é descartado. Status em `GET /api/v1/monitoring/identity-observations/status`; métricas `home_ia_identity_observations_*` em `/metrics`.
+- Rollback: `..._ENABLED=false` e reinício do serviço; nenhum dado persistido no serviço precisa ser removido.
+
 ## Regras de migração e rollback
 
 - Nenhuma fase move dados por cópia destrutiva: inventariar, copiar/validar, reconciliar e só então cortar.

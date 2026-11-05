@@ -26,6 +26,18 @@ public sealed class ServiceTokenAuthTests
     }
 
     [Fact]
+    public async Task Metrics_endpoint_stays_public()
+    {
+        await using var factory = Factory();
+        using var client = factory.CreateClient();
+
+        var response = await client.GetAsync("/metrics");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/plain", response.Content.Headers.ContentType?.MediaType);
+    }
+
+    [Fact]
     public async Task Missing_token_is_rejected()
     {
         await using var factory = Factory();

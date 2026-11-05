@@ -17,13 +17,15 @@ public sealed class CaptureSettingsStore
     private readonly SemaphoreSlim _changed = new(0, 1);
     private CaptureRuntimeSettings _current;
     private readonly string _path;
+    private readonly PlatformEventOutbox? _outbox;
 
     public CaptureSettingsStore(MonitoringOptions monitoring, CaptureWriterOptions bootstrap,
-        IConfiguration configuration)
+        IConfiguration configuration, PlatformEventOutbox? outbox = null)
     {
         _path = configuration["MONITORING_CAPTURE_SETTINGS_FILE"] ??
                 Path.Combine(monitoring.SpoolDirectory, "capture-settings.json");
         _current = Load(bootstrap);
+        _outbox = outbox;
     }
 
     public CaptureRuntimeSettings Current
@@ -62,6 +64,9 @@ public sealed class CaptureSettingsStore
         lock (_gate) _current = updated;
         if (_changed.CurrentCount == 0) _changed.Release();
         Changed?.Invoke();
+        if (_outbox is not null)
+            await _outbox.EnqueueAsync(new PlatformEventOutboxEvent("monitoring.capture.settings.updated",
+                "configuration", "info", "success", "monitoring.capture", "settings"), cancellationToken);
         return updated;
     }
 

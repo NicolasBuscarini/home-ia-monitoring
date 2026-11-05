@@ -63,7 +63,7 @@ O serviço não autentica usuários e não decide autorização. Ele lê/escreve
 - `MONITORING_EVENT_OUTBOX_PORTAL_URL` deve apontar para a API do portal alcançável pelo serviço. O token reutiliza `MONITORING_SERVICE_TOKEN_SECRET` com `sub=monitoring`, audiência `MONITORING_EVENT_TOKEN_AUDIENCE` (default `home-ia-portal`) e `residence_id` de `PORTAL_RESIDENCE_ID`/`MONITORING_RESIDENCE_ID`; o segredo e a residência precisam coincidir com o portal.
 - Falha de rede, `5xx`, `408` e `429` mantêm o item pendente com tentativa contabilizada; rejeição definitiva ou excesso de `MONITORING_EVENT_OUTBOX_MAX_ATTEMPTS` move para `events/outbox/dead/`. `MONITORING_EVENT_OUTBOX_MAX_EVENTS`/`_MAX_BYTES` descartam o mais antigo e `_MAX_AGE_DAYS` expira pendências, sempre com contador.
 - `GET /api/v1/monitoring/events/outbox` informa profundidade, bytes, enviados, falhas, descartes, dead-letter e última falha. Captura, mídia e HLS nunca esperam o portal.
-- Primeira adoção: `clip.retention.expired` após a remoção confirmada do clipe arquivado.
+- Adoções: `clip.retention.expired` após a remoção confirmada do clipe arquivado, `roster.person.created`/`roster.person.removed`, `biometric.enrollment_created`/`biometric.enrollment_revoked` e `monitoring.capture.settings.updated`; política de análise e retenção continuam auditadas pelo portal.
 - `GET /metrics` expõe a outbox em texto Prometheus (`monitoring_event_outbox_*`: enabled, pending, bytes, enviados/falhas/descartes, dead-letter e último sucesso); é público apenas em loopback/rede interna e não inclui erro em texto livre. O runbook fica em `docs/operacao/21_RUNBOOK_EVENTSTORE.md` no repositório de contexto.
 
 ## Análise (`T16-C-C-B-B-A/B`)
@@ -122,7 +122,7 @@ A partir da raiz do contexto:
 
 ## Limites
 
-- Não há NAS, reconhecimento facial ou banco operacional neste serviço ainda; roster, retenção, HLS e inscrições biométricas cifradas usam arquivos JSON atômicos e o spool configurado.
+- Não há NAS, reconhecimento facial real ou banco operacional neste serviço ainda; roster, retenção, HLS e inscrições biométricas cifradas usam arquivos JSON atômicos e o spool configurado. O producer de observação de identidade (`T09-PRODUCER`, ADR122) varre clipes `ready`, usa fonte `synthetic` por padrão desativado, fila limitada em memória e token `identity.observations.write`; sem modelo/pesos e sem embedding em disco.
 - HLS e materialização de clipe são servidos apenas para a câmera configurada e nunca aceitam caminho arbitrário; a política de disparo, a autorização e o estado do manifesto de clipe continuam no portal.
 - Arquivo/retenção e expiração biométrica são instâncias únicas, sem lease distribuído; a auditoria de expiração permanece no worker local do portal e não há migração automática das políticas/preservações/inscrições SQLite existentes.
 - A captura é single-camera e single-host; não há concorrência de câmeras, autenticação serviço-a-serviço ou validação física/24×7.

@@ -43,6 +43,12 @@ public sealed record ClipLibraryPage(IReadOnlyList<ClipLibraryItem> Items, int P
 public interface IClipPlaybackSource
 {
     Task<ClipLibraryItem?> GetAsync(string publicId, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Clipes <c>ready</c> mais recentes para consumidores de fundo. Confirma somente estado e
+    /// presença do arquivo de mídia; não relê bytes nem valida o hash a cada varredura.
+    /// </summary>
+    Task<IReadOnlyList<ClipLibraryItem>> ListReadyAsync(int take, CancellationToken cancellationToken);
     Task<string?> GetPlaybackPathAsync(string publicId, CancellationToken cancellationToken);
 }
 
@@ -129,6 +135,24 @@ public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions cap
         var orderedArray = ordered.ToArray();
         var items = orderedArray.Skip((page - 1) * pageSize).Take(pageSize).Select(Map).ToArray();
         return new(items, page, pageSize, orderedArray.Length);
+    }
+
+    public async Task<IReadOnlyList<ClipLibraryItem>> ListReadyAsync(int take,
+        CancellationToken cancellationToken)
+    {
+        if (take < 1) return [];
+        var items = new List<ClipLibraryItem>(Math.Min(take, 64));
+        foreach (var path in EnumerateManifestPaths())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var clip = await ReadManifestAsync(path, cancellationToken);
+            if (clip is null || clip.State != "ready") continue;
+            if (Resolve("media", clip.MediaFileName, clip.MediaSha256) is null) continue;
+            items.Add(Map(clip));
+            if (items.Count >= take) break;
+        }
+
+        return items;
     }
 
     public async Task<ClipLibraryItem?> GetAsync(string publicId, CancellationToken cancellationToken)

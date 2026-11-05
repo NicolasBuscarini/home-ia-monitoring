@@ -89,7 +89,8 @@ public sealed record BiometricCiphertextEnvelope(
 /// authorization, consent text, extraction/protection and audit remain in the portal; this store
 /// only receives ciphertext and enforces retention, replacement and tombstone invariants.
 /// </summary>
-public sealed class BiometricStore(MonitoringOptions monitoring, TimeProvider timeProvider)
+public sealed class BiometricStore(MonitoringOptions monitoring, TimeProvider timeProvider,
+    PlatformEventOutbox? outbox = null)
 {
     public const string ConsentVersion = "biometric-consent.v1";
     public const int RetentionDays = 365;
@@ -240,6 +241,9 @@ public sealed class BiometricStore(MonitoringOptions monitoring, TimeProvider ti
                 1);
             await WriteUnderLockAsync(enrollment, cancellationToken);
             _enrollments[publicId] = enrollment;
+            if (outbox is not null)
+                await outbox.EnqueueAsync(new PlatformEventOutboxEvent("biometric.enrollment_created",
+                    "biometrics", "info", "success", "biometric_enrollment", publicId), cancellationToken);
             return new BiometricEnrollmentResult(ToSummary(enrollment), replaced);
         }
         finally { _gate.Release(); }
@@ -270,6 +274,9 @@ public sealed class BiometricStore(MonitoringOptions monitoring, TimeProvider ti
             };
             await WriteUnderLockAsync(tombstone, cancellationToken);
             _enrollments[publicId] = tombstone;
+            if (outbox is not null)
+                await outbox.EnqueueAsync(new PlatformEventOutboxEvent("biometric.enrollment_revoked",
+                    "biometrics", "warning", "success", "biometric_enrollment", publicId), cancellationToken);
         }
         finally { _gate.Release(); }
     }
