@@ -57,6 +57,14 @@ O serviço não autentica usuários e não decide autorização. Ele lê/escreve
 - A recuperação remove temporários, valida cada envelope e reconcilia a contagem no startup; eventos inválidos são apenas contados e não interrompem a captura.
 - Em `MONITORING_EVENTS_SOURCE=remote`, o portal deixa de escrever localmente e usa estes endpoints; `local` mantém o journal no processo atual.
 
+## Auditoria (`T17-D`)
+
+- `MONITORING_EVENT_OUTBOX_ENABLED=false` desativa a outbox; com `true`, eventos de auditoria do serviço vão para `events/outbox/` no spool e são enviados ao portal em lote.
+- `MONITORING_EVENT_OUTBOX_PORTAL_URL` deve apontar para a API do portal alcançável pelo serviço. O token reutiliza `MONITORING_SERVICE_TOKEN_SECRET` com `sub=monitoring`, audiência `MONITORING_EVENT_TOKEN_AUDIENCE` (default `home-ia-portal`) e `residence_id` de `PORTAL_RESIDENCE_ID`/`MONITORING_RESIDENCE_ID`; o segredo e a residência precisam coincidir com o portal.
+- Falha de rede, `5xx`, `408` e `429` mantêm o item pendente com tentativa contabilizada; rejeição definitiva ou excesso de `MONITORING_EVENT_OUTBOX_MAX_ATTEMPTS` move para `events/outbox/dead/`. `MONITORING_EVENT_OUTBOX_MAX_EVENTS`/`_MAX_BYTES` descartam o mais antigo e `_MAX_AGE_DAYS` expira pendências, sempre com contador.
+- `GET /api/v1/monitoring/events/outbox` informa profundidade, bytes, enviados, falhas, descartes, dead-letter e última falha. Captura, mídia e HLS nunca esperam o portal.
+- Primeira adoção: `clip.retention.expired` após a remoção confirmada do clipe arquivado.
+
 ## Análise (`T16-C-C-B-B-A/B`)
 
 - `GET/PUT /api/v1/monitoring/analysis/policies/{cameraId}` — política `always|large_motion|manual_only|never` por câmera, versionada; atualização exige `expectedVersion`.

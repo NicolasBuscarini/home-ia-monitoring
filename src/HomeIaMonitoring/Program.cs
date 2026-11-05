@@ -54,6 +54,12 @@ builder.Services.AddSingleton<ICaptureAdapterFactory>(provider =>
 builder.Services.AddSingleton<CaptureWorker>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<CaptureWorker>());
 builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton(provider => PlatformEventOutboxOptions.FromConfiguration(
+    provider.GetRequiredService<IConfiguration>(), provider.GetRequiredService<MonitoringOptions>()));
+builder.Services.AddSingleton(provider => new PlatformEventOutbox(
+    provider.GetRequiredService<PlatformEventOutboxOptions>(), provider.GetRequiredService<TimeProvider>()));
+builder.Services.AddSingleton<PlatformEventOutboxWorker>();
+builder.Services.AddHostedService(provider => provider.GetRequiredService<PlatformEventOutboxWorker>());
 
 var app = builder.Build();
 
@@ -396,6 +402,8 @@ app.MapGet("/api/v1/monitoring/events",
 app.MapGet("/api/v1/monitoring/events/recovery",
     async (EventJournal journal, CancellationToken cancellationToken) =>
         Results.Ok(await journal.RecoverAsync(cancellationToken)));
+app.MapGet("/api/v1/monitoring/events/outbox",
+    (PlatformEventOutbox outbox) => Results.Ok(outbox.GetStatus()));
 app.MapGet("/api/v1/monitoring/analysis/policies/{cameraId}",
     async (string cameraId, AnalysisDispatchStore store, CancellationToken cancellationToken) =>
     {

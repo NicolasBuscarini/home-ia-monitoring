@@ -512,7 +512,8 @@ public sealed class RetentionStore(MonitoringOptions monitoring, TimeProvider ti
 }
 
 public sealed class ClipRetentionWorker(ArchiveOptions options, ClipArchiveService archive,
-    RetentionStore store, AnalysisDispatchStore analysis, MonitoringOptions monitoring, TimeProvider timeProvider)
+    RetentionStore store, AnalysisDispatchStore analysis, MonitoringOptions monitoring, TimeProvider timeProvider,
+    PlatformEventOutbox? outbox = null)
     : BackgroundService
 {
     private readonly SemaphoreSlim runGate = new(1, 1);
@@ -589,6 +590,9 @@ public sealed class ClipRetentionWorker(ArchiveOptions options, ClipArchiveServi
         File.Delete(thumbnailPath);
         File.Delete(manifestPath);
         Directory.Delete(directory);
+        if (outbox is not null)
+            await outbox.EnqueueAsync(new PlatformEventOutboxEvent("clip.retention.expired", "media", "info",
+                "success", "clip", entry.ClipId), cancellationToken);
     }
 
     private async Task MarkSourceExpiredAsync(ArchivedClipManifestV1 entry, CancellationToken cancellationToken)

@@ -17,7 +17,7 @@ Este inventário orienta a extração do runtime de Monitoramento do monólito `
 ## Tabelas e arquivos a inventariar antes de mover
 
 - Tabelas SQLite: `CameraContexts`, `CameraCatalog`, `ClipAnalysisDispatchPolicies`, `ClipAnalysisJobs`, `KnownPeople`, `BiometricEnrollments`, `FaceExtractorCandidates`, `FaceExtractorSelections`, `ClipRetentionPolicies`, `ClipPreservations`.
-- Spool: `segments/`, `clips/manifests/`, `clips/media/`, `clips/playback/`, `events/`, `analysis/`, `gaps/`.
+- Spool: `segments/`, `clips/manifests/`, `clips/media/`, `clips/playback/`, `events/` (journal e `outbox/` de auditoria), `analysis/`, `gaps/`.
 - Arquivo: `archive/<camera>/<clip>/` com `archive-manifest.json`.
 - Modelos/artefatos: `face-models` (read-only) e configuração de captura por ambiente.
 - Contratos: capture segment/gap, clip manifest, archived clip manifest, detection result, event rules.
