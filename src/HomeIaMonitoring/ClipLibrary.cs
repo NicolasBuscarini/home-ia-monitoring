@@ -36,6 +36,13 @@ public sealed record ClipLibraryItem(string PublicId, string ClipId, string Came
 
 public sealed record ClipLibraryPage(IReadOnlyList<ClipLibraryItem> Items, int Page, int PageSize, int Total);
 
+public enum ClipDeleteStatus { Deleted, NotFound, NotReady, Preserved, Archived, Failed }
+
+public sealed record ClipDeleteResult(ClipDeleteStatus Status, string? Error = null);
+
+public sealed record ClipDeleteAllResult(int Deleted, int SkippedPreserved, int SkippedArchived,
+    int SkippedNotReady, int SkippedActiveAnalysis, int Failed);
+
 /// <summary>
 /// Read-only clip library over the shared spool. Authorization stays in the portal; this service
 /// only exposes manifests and validated media for the camera identifiers the caller supplies.
@@ -70,7 +77,8 @@ public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions cap
             (minDurationSeconds.HasValue && maxDurationSeconds.HasValue &&
                 minDurationSeconds > maxDurationSeconds) ||
             (state is not null && !States.Contains(state)) ||
-            (analysis is not null && analysis is not ("performed" or "not_performed")) ||
+            (analysis is not null && analysis is not ("performed" or "not_performed" or
+                "pending" or "completed" or "failed")) ||
             (sort is not null && sort is not ("newest" or "oldest" or "longest" or "shortest" or
                 "largest" or "smallest")))
             throw new ArgumentException("invalid_clip_query");
@@ -95,15 +103,24 @@ public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions cap
         }
         if (analysis is not null)
         {
-            var performed = new HashSet<string>(StringComparer.Ordinal);
+            var filter = analysis;
+            var jobStates = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var batch in clips.Select(clip => clip.PublicId!).Chunk(100))
             {
                 var jobs = await analysisStore.LatestForClipsAsync(batch, cancellationToken);
-                foreach (var job in jobs) performed.Add(job.ClipPublicId);
+                foreach (var job in jobs) jobStates[job.ClipPublicId] = job.State;
             }
-            clips = clips.Where(clip => analysis == "performed"
-                ? performed.Contains(clip.PublicId!)
-                : !performed.Contains(clip.PublicId!)).ToList();
+            clips = clips.Where(clip =>
+            {
+                var hasJob = jobStates.TryGetValue(clip.PublicId!, out var state);
+                return filter switch
+                {
+                    "performed" => hasJob,
+                    "not_performed" => !hasJob,
+                    "pending" => hasJob && state is "analysis_pending" or "processing",
+                    _ => hasJob && state == filter
+                };
+            }).ToList();
         }
         if (preserved is not null)
         {
@@ -163,6 +180,96 @@ public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions cap
             if (clip?.PublicId == publicId) return Map(clip);
         }
         return null;
+    }
+
+    /// <summary>
+    /// Removes one ready clip from the local spool. Preserved and archived clips are refused;
+    /// the manifest is deleted last so an interrupted deletion cannot hide remaining media.
+    /// </summary>
+    public async Task<ClipDeleteResult> DeleteAsync(string publicId, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(publicId) || publicId.Length > 64) return new(ClipDeleteStatus.NotFound);
+        foreach (var manifestPath in EnumerateManifestPaths())
+        {
+            var clip = await ReadManifestAsync(manifestPath, cancellationToken);
+            if (clip?.PublicId != publicId) continue;
+            if (clip.State != "ready") return new(ClipDeleteStatus.NotReady, "clip_not_ready");
+            var preservation = await retentionStore.ListPreservationsAsync([publicId], cancellationToken);
+            if (preservation.Any(item => item.IsPreserved))
+                return new(ClipDeleteStatus.Preserved, "clip_preserved");
+            if (clip.ArchiveStatus == "archived") return new(ClipDeleteStatus.Archived, "clip_archived");
+            return DeleteFiles(manifestPath, clip)
+                ? new(ClipDeleteStatus.Deleted)
+                : new(ClipDeleteStatus.Failed, "clip_delete_failed");
+        }
+        return new(ClipDeleteStatus.NotFound);
+    }
+
+    /// <summary>
+    /// Deletes every ready clip that is neither preserved nor archived. Preservation is evaluated
+    /// before archive state so a protected clip is never removed. Invalid manifests and clips in
+    /// any other state are left in place.
+    /// </summary>
+    public async Task<ClipDeleteAllResult> DeleteAllAsync(CancellationToken cancellationToken)
+    {
+        var manifests = new List<(string Path, ClipManifestV1 Clip)>();
+        foreach (var manifestPath in EnumerateManifestPaths())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var clip = await ReadManifestAsync(manifestPath, cancellationToken);
+            if (clip is not null) manifests.Add((manifestPath, clip));
+        }
+
+        var preserved = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var batch in manifests.Select(item => item.Clip.PublicId!).Chunk(100))
+            foreach (var item in await retentionStore.ListPreservationsAsync(batch, cancellationToken))
+                if (item.IsPreserved) preserved.Add(item.ClipPublicId);
+
+        var activeAnalysis = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var batch in manifests.Where(item => item.Clip.State == "ready" &&
+                     item.Clip.ArchiveStatus != "archived" && !preserved.Contains(item.Clip.PublicId!))
+                     .Select(item => item.Clip.PublicId!).Chunk(100))
+            foreach (var job in await analysisStore.LatestForClipsAsync(batch, cancellationToken))
+                if (job.State is "analysis_pending" or "processing") activeAnalysis.Add(job.ClipPublicId);
+
+        var deleted = 0;
+        var skippedPreserved = 0;
+        var skippedArchived = 0;
+        var skippedNotReady = 0;
+        var skippedActiveAnalysis = 0;
+        var failed = 0;
+        foreach (var (manifestPath, clip) in manifests)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (preserved.Contains(clip.PublicId!)) skippedPreserved++;
+            else if (clip.ArchiveStatus == "archived") skippedArchived++;
+            else if (clip.State != "ready") skippedNotReady++;
+            else if (activeAnalysis.Contains(clip.PublicId!)) skippedActiveAnalysis++;
+            else if (DeleteFiles(manifestPath, clip)) deleted++;
+            else failed++;
+        }
+        return new(deleted, skippedPreserved, skippedArchived, skippedNotReady, skippedActiveAnalysis, failed);
+    }
+
+    private bool DeleteFiles(string manifestPath, ClipManifestV1 clip)
+    {
+        try
+        {
+            var media = Resolve("media", clip.MediaFileName, clip.MediaSha256);
+            if (media is not null) File.Delete(media);
+            var thumbnail = Resolve("thumbnails", clip.ThumbnailFileName, clip.ThumbnailSha256);
+            if (thumbnail is not null) File.Delete(thumbnail);
+            var playbackDirectory = Path.Combine(monitoring.SpoolDirectory, "clips", "playback");
+            if (Directory.Exists(playbackDirectory))
+                foreach (var playback in Directory.EnumerateFiles(playbackDirectory, $"{clip.ClipId}-*.mp4"))
+                    File.Delete(playback);
+            File.Delete(manifestPath);
+            return true;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     public async Task<string?> GetThumbnailPathAsync(string publicId, CancellationToken cancellationToken)

@@ -139,7 +139,7 @@ public sealed class AnalysisDispatchStore
                 return Map(byKey, true);
             }
             var existing = jobs.Values.SingleOrDefault(job => job.ClipId == request.ClipId &&
-                job.AnalysisVersion == request.AnalysisVersion);
+                job.AnalysisVersion == request.AnalysisVersion && job.State != "failed");
             if (existing is not null) return Map(existing, true);
             var active = jobs.Values.Count(job => job.State is "analysis_pending" or "processing");
             if (active >= options.QueueCapacity) throw new AnalysisCapacityException();

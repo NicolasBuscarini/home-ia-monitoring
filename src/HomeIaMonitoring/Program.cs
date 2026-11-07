@@ -62,10 +62,25 @@ builder.Services.AddSingleton<PlatformEventOutboxWorker>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<PlatformEventOutboxWorker>());
 builder.Services.AddSingleton(provider =>
     IdentityObservationOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
+builder.Services.AddSingleton(provider =>
+    FaceRecognitionOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
+builder.Services.AddSingleton(provider => FaceArtifactVerifier.Verify(provider.GetRequiredService<FaceRecognitionOptions>()));
+builder.Services.AddSingleton<IFaceFrameExtractor>(provider =>
+    new FfmpegFaceFrameExtractor(provider.GetRequiredService<FaceRecognitionOptions>()));
 builder.Services.AddSingleton<IFaceObservationSource>(provider =>
-    provider.GetRequiredService<IdentityObservationOptions>().Source == IdentityObservationOptions.SyntheticSource
-        ? new SyntheticFaceObservationSource()
-        : new DisabledFaceObservationSource());
+{
+    var source = provider.GetRequiredService<IdentityObservationOptions>().Source;
+    if (source == IdentityObservationOptions.SyntheticSource) return new SyntheticFaceObservationSource();
+    if (source != IdentityObservationOptions.OnnxSource) return new DisabledFaceObservationSource();
+    return new OnnxFaceObservationSource(
+        provider.GetRequiredService<FaceRecognitionOptions>(),
+        provider.GetRequiredService<FaceArtifactStatus>(),
+        provider.GetRequiredService<IClipPlaybackSource>(),
+        provider.GetRequiredService<IFaceFrameExtractor>(),
+        options => new YuNetFaceDetector(options),
+        options => new SFaceEmbedder(options),
+        provider.GetRequiredService<ILogger<OnnxFaceObservationSource>>());
+});
 builder.Services.AddSingleton(provider => new IdentityObservationProducer(
     provider.GetRequiredService<IdentityObservationOptions>(),
     provider.GetRequiredService<IClipPlaybackSource>(),
@@ -78,6 +93,12 @@ builder.Services.AddHostedService(provider => new IdentityObservationWorker(
     provider.GetRequiredService<ILogger<IdentityObservationWorker>>()));
 
 var app = builder.Build();
+
+var observationOptions = app.Services.GetRequiredService<IdentityObservationOptions>();
+app.Logger.LogInformation(
+    "Observação facial: producer={Enabled}, fonte={Source}, artefatos={ArtifactState}.",
+    observationOptions.Enabled, observationOptions.Source,
+    app.Services.GetRequiredService<FaceArtifactStatus>().State);
 
 var serviceTokenOptions = app.Services.GetRequiredService<ServiceTokenOptions>();
 app.Use(async (context, next) =>
@@ -144,6 +165,20 @@ app.MapGet("/api/v1/monitoring/clips/{publicId}",
     {
         var clip = await library.GetAsync(publicId, cancellationToken);
         return clip is null ? Results.NotFound() : Results.Ok(clip);
+    });
+app.MapPost("/api/v1/monitoring/clips/delete-all",
+    async (ClipLibrary library, CancellationToken cancellationToken) =>
+        Results.Ok(await library.DeleteAllAsync(cancellationToken)));
+app.MapDelete("/api/v1/monitoring/clips/{publicId}",
+    async (string publicId, ClipLibrary library, CancellationToken cancellationToken) =>
+    {
+        var result = await library.DeleteAsync(publicId, cancellationToken);
+        return result.Status switch
+        {
+            ClipDeleteStatus.Deleted => Results.NoContent(),
+            ClipDeleteStatus.NotFound => Results.NotFound(new { error = "clip_not_found" }),
+            _ => Results.Conflict(new { error = result.Error })
+        };
     });
 app.MapGet("/api/v1/monitoring/clips/{publicId}/thumbnail",
     async (string publicId, ClipLibrary library, CancellationToken cancellationToken) =>

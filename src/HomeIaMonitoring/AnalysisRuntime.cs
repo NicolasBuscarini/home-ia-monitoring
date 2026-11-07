@@ -9,25 +9,47 @@ namespace HomeIaMonitoring;
 /// <summary>Detector adapter configuration. Only used when analysis execution is explicitly enabled.</summary>
 public sealed record AnalysisDetectorOptions(string ModelPath, string ModelVersion, string InputName,
     string OutputName, int Width, int Height, float ScoreThreshold, string[] Labels, int IntraOpThreads,
-    int InterOpThreads)
+    int InterOpThreads, string Adapter, float NmsThreshold, string ModelSha256)
 {
     public const string ModelPathKey = "MONITORING_DETECTOR_ONNX_MODEL_PATH";
     public const string ModelVersionKey = "MONITORING_DETECTOR_MODEL_VERSION";
-    public const string InputNameKey = "MONITORING_DETECTOR_INPUT_NAME";
-    public const string OutputNameKey = "MONITORING_DETECTOR_OUTPUT_NAME";
+    public const string ModelSha256Key = "MONITORING_DETECTOR_ONNX_MODEL_SHA256";
+    public const string InputNameKey = "MONITORING_DETECTOR_ONNX_INPUT_NAME";
+    public const string OutputNameKey = "MONITORING_DETECTOR_ONNX_OUTPUT_NAME";
     public const string WidthKey = "MONITORING_DETECTOR_INPUT_WIDTH";
     public const string HeightKey = "MONITORING_DETECTOR_INPUT_HEIGHT";
     public const string ScoreThresholdKey = "MONITORING_DETECTOR_SCORE_THRESHOLD";
+    public const string NmsThresholdKey = "MONITORING_DETECTOR_NMS_THRESHOLD";
     public const string LabelsKey = "MONITORING_DETECTOR_LABELS";
+    public const string AdapterKey = "MONITORING_DETECTOR_ADAPTER";
     public const string IntraOpThreadsKey = "MONITORING_DETECTOR_INTRA_OP_THREADS";
     public const string InterOpThreadsKey = "MONITORING_DETECTOR_INTER_OP_THREADS";
+
+    public const string FlatAdapter = "flat";
+    public const string YoloxAdapter = "yolox";
+
+    /// <summary>COCO class order used by YOLOX. <c>MONITORING_DETECTOR_LABELS=coco</c> expands to it.</summary>
+    public static readonly string[] CocoLabels =
+    [
+        "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+        "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+        "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+        "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+        "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+        "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard",
+        "cell phone", "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+        "scissors", "teddy bear", "hair drier", "toothbrush"
+    ];
 
     public bool Enabled => !string.IsNullOrWhiteSpace(ModelPath);
 
     public static AnalysisDetectorOptions FromConfiguration(IConfiguration configuration)
     {
-        var labels = (configuration[LabelsKey] ?? string.Empty).Split(',',
-            StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var configuredLabels = configuration[LabelsKey]?.Trim() ?? string.Empty;
+        var labels = configuredLabels.Equals("coco", StringComparison.OrdinalIgnoreCase)
+            ? CocoLabels
+            : configuredLabels.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         var options = new AnalysisDetectorOptions(
             configuration[ModelPathKey]?.Trim() ?? string.Empty,
             configuration[ModelVersionKey]?.Trim() ?? "detector-v1",
@@ -38,13 +60,19 @@ public sealed record AnalysisDetectorOptions(string ModelPath, string ModelVersi
             configuration.GetValue<float?>(ScoreThresholdKey) ?? 0.35f,
             labels,
             configuration.GetValue<int?>(IntraOpThreadsKey) ?? 1,
-            configuration.GetValue<int?>(InterOpThreadsKey) ?? 1);
+            configuration.GetValue<int?>(InterOpThreadsKey) ?? 1,
+            configuration[AdapterKey]?.Trim().ToLowerInvariant() ?? FlatAdapter,
+            configuration.GetValue<float?>(NmsThresholdKey) ?? 0.45f,
+            configuration[ModelSha256Key]?.Trim().ToLowerInvariant() ?? string.Empty);
         if (options.Enabled && (options.ModelPath.Length > 512 || !Path.IsPathFullyQualified(options.ModelPath) ||
             options.ModelVersion.Length is 0 or > 64 || options.InputName.Length is 0 or > 128 ||
             options.OutputName.Length is 0 or > 128 || options.Width is < 32 or > 4096 ||
             options.Height is < 32 or > 4096 || options.ScoreThreshold is <= 0 or > 1 ||
             options.Labels.Length is 0 or > 512 || options.Labels.Any(label => label.Length is 0 or > 64) ||
-            options.IntraOpThreads is < 1 or > 32 || options.InterOpThreads is < 1 or > 32))
+            options.IntraOpThreads is < 1 or > 32 || options.InterOpThreads is < 1 or > 32 ||
+            options.Adapter is not (FlatAdapter or YoloxAdapter) || options.NmsThreshold is <= 0 or > 1 ||
+            options.ModelSha256 is { Length: > 0 } hash && (hash.Length != 64 ||
+                !hash.All(character => char.IsAsciiHexDigit(character)))))
             throw new InvalidOperationException("A configuração do detector de análise é inválida.");
         return options;
     }
@@ -162,14 +190,25 @@ public sealed class OnnxAnalysisDetector : IAnalysisDetector, IDisposable
 {
     private readonly AnalysisDetectorOptions options;
     private readonly Lazy<InferenceSession?> session;
+    private string inputName;
+    private string outputName;
 
     public OnnxAnalysisDetector(AnalysisDetectorOptions options)
     {
         this.options = options;
+        inputName = options.InputName;
+        outputName = options.OutputName;
         session = new Lazy<InferenceSession?>(() =>
         {
             if (!options.Enabled) return null;
             if (!File.Exists(options.ModelPath)) throw new InvalidOperationException("detector_model_unavailable");
+            if (options.ModelSha256.Length > 0)
+            {
+                using var stream = File.OpenRead(options.ModelPath);
+                var actual = Convert.ToHexStringLower(SHA256.HashData(stream));
+                if (!string.Equals(actual, options.ModelSha256, StringComparison.Ordinal))
+                    throw new InvalidOperationException("detector_model_checksum_mismatch");
+            }
             var sessionOptions = new Microsoft.ML.OnnxRuntime.SessionOptions
             {
                 IntraOpNumThreads = options.IntraOpThreads,
@@ -178,12 +217,21 @@ public sealed class OnnxAnalysisDetector : IAnalysisDetector, IDisposable
             };
             using var lifetime = sessionOptions;
             var created = new InferenceSession(options.ModelPath, sessionOptions);
-            if (!created.InputMetadata.ContainsKey(options.InputName) ||
-                !created.OutputMetadata.ContainsKey(options.OutputName))
+            var resolvedInput = created.InputMetadata.Keys.FirstOrDefault(key =>
+                string.Equals(key.Trim(), options.InputName.Trim(), StringComparison.OrdinalIgnoreCase));
+            var resolvedOutput = created.OutputMetadata.Keys.FirstOrDefault(key =>
+                string.Equals(key.Trim(), options.OutputName.Trim(), StringComparison.OrdinalIgnoreCase));
+            if (resolvedInput is null || resolvedOutput is null)
             {
+                var inputs = string.Join(",", created.InputMetadata.Keys);
+                var outputs = string.Join(",", created.OutputMetadata.Keys);
                 created.Dispose();
-                throw new InvalidOperationException("detector_io_incompatible");
+                throw new InvalidOperationException(
+                    $"detector_io_incompatible:inputs={inputs};outputs={outputs};" +
+                    $"configuredInput={options.InputName};configuredOutput={options.OutputName}");
             }
+            inputName = resolvedInput;
+            outputName = resolvedOutput;
             return created;
         }, LazyThreadSafetyMode.ExecutionAndPublication);
     }
@@ -198,26 +246,117 @@ public sealed class OnnxAnalysisDetector : IAnalysisDetector, IDisposable
         if (frame.Width != options.Width || frame.Height != options.Height ||
             frame.RgbNchw.Length != checked(3 * options.Width * options.Height))
             throw new InvalidDataException("detector_input_shape_invalid");
-        var tensor = new DenseTensor<float>(frame.RgbNchw.ToArray(), [1, 3, options.Height, options.Width]);
-        using var results = active.Run([NamedOnnxValue.CreateFromTensor(options.InputName, tensor)],
-            [options.OutputName]);
+        var input = frame.RgbNchw.ToArray();
+        if (options.Adapter == AnalysisDetectorOptions.YoloxAdapter)
+        {
+            var plane = options.Width * options.Height;
+            for (var index = 0; index < plane; index++)
+                (input[index], input[2 * plane + index]) = (input[2 * plane + index], input[index]);
+        }
+        var tensor = new DenseTensor<float>(input, [1, 3, options.Height, options.Width]);
+        using var results = active.Run([NamedOnnxValue.CreateFromTensor(inputName, tensor)],
+            [outputName]);
         cancellationToken.ThrowIfCancellationRequested();
         var output = results.First().AsTensor<float>();
-        if (output.Length % 6 != 0 || output.Length > 6 * 10000) throw new InvalidDataException("detector_output_shape_invalid");
         var values = output.ToArray();
-        var detections = new List<AnalysisDetection>(Math.Min(values.Length / 6, 256));
+        IReadOnlyList<AnalysisDetection> detections = options.Adapter == AnalysisDetectorOptions.YoloxAdapter
+            ? DecodeYolox(values, options.Width, options.Height, options.ScoreThreshold, options.NmsThreshold,
+                options.Labels, 256)
+            : DecodeFlat(values, options.ScoreThreshold, options.Labels, 256);
+        return ValueTask.FromResult(detections);
+    }
+
+    /// <summary>Decodes the contract used by the test graph: one row of x1,y1,x2,y2,score,class.</summary>
+    internal static IReadOnlyList<AnalysisDetection> DecodeFlat(float[] values, float scoreThreshold, string[] labels,
+        int maximumDetections)
+    {
+        if (values.Length % 6 != 0 || values.Length > 6 * 10000)
+            throw new InvalidDataException("detector_output_shape_invalid");
+        var detections = new List<AnalysisDetection>(Math.Min(values.Length / 6, maximumDetections));
         for (var offset = 0; offset < values.Length; offset += 6)
         {
             var classValue = values[offset + 5];
             if (!float.IsFinite(classValue) || classValue < 0 || classValue != MathF.Truncate(classValue) ||
-                classValue >= options.Labels.Length || values[offset + 4] < options.ScoreThreshold) continue;
-            var detection = new AnalysisDetection(options.Labels[(int)classValue], (int)classValue,
+                classValue >= labels.Length || values[offset + 4] < scoreThreshold) continue;
+            var detection = new AnalysisDetection(labels[(int)classValue], (int)classValue,
                 values[offset + 4], values[offset], values[offset + 1], values[offset + 2], values[offset + 3]);
             if (!detection.IsValid) continue;
             detections.Add(detection);
-            if (detections.Count == 256) break;
+            if (detections.Count == maximumDetections) break;
         }
-        return ValueTask.FromResult<IReadOnlyList<AnalysisDetection>>(detections);
+        return detections;
+    }
+
+    /// <summary>Decodes YOLOX raw output [1, N, 5 + classes] for the fixed strides 8/16/32.</summary>
+    internal static IReadOnlyList<AnalysisDetection> DecodeYolox(float[] values, int width, int height,
+        float scoreThreshold, float nmsThreshold, string[] labels, int maximumDetections)
+    {
+        const int rowSize = 85;
+        var strides = new[] { 8, 16, 32 };
+        var expectedRows = strides.Sum(stride => (width / stride) * (height / stride));
+        if (labels.Length < rowSize - 5 || values.Length != expectedRows * rowSize)
+            throw new InvalidDataException("detector_output_shape_invalid");
+
+        var candidates = new List<AnalysisDetection>(Math.Min(expectedRows, 1024));
+        var row = 0;
+        foreach (var stride in strides)
+        {
+            var gridWidth = width / stride;
+            var gridHeight = height / stride;
+            for (var gridY = 0; gridY < gridHeight; gridY++)
+            {
+                for (var gridX = 0; gridX < gridWidth; gridX++, row++)
+                {
+                    var offset = row * rowSize;
+                    var objectness = values[offset + 4];
+                    if (!float.IsFinite(objectness) || objectness <= 0) continue;
+                    var classId = 0;
+                    var classScore = 0f;
+                    for (var index = 0; index < labels.Length; index++)
+                    {
+                        var candidate = values[offset + 5 + index];
+                        if (candidate > classScore)
+                        {
+                            classScore = candidate;
+                            classId = index;
+                        }
+                    }
+                    var score = objectness * classScore;
+                    if (!float.IsFinite(score) || score < scoreThreshold) continue;
+
+                    var centerX = (values[offset] + gridX) * stride;
+                    var centerY = (values[offset + 1] + gridY) * stride;
+                    var boxWidth = MathF.Exp(values[offset + 2]) * stride;
+                    var boxHeight = MathF.Exp(values[offset + 3]) * stride;
+                    var detection = new AnalysisDetection(labels[classId], classId, score,
+                        Math.Clamp((centerX - boxWidth / 2) / width, 0, 1),
+                        Math.Clamp((centerY - boxHeight / 2) / height, 0, 1),
+                        Math.Clamp((centerX + boxWidth / 2) / width, 0, 1),
+                        Math.Clamp((centerY + boxHeight / 2) / height, 0, 1));
+                    if (detection.IsValid) candidates.Add(detection);
+                }
+            }
+        }
+
+        var selected = new List<AnalysisDetection>(Math.Min(candidates.Count, maximumDetections));
+        foreach (var candidate in candidates.OrderByDescending(item => item.Score))
+        {
+            if (selected.Any(item => item.ClassId == candidate.ClassId &&
+                    IntersectionOverUnion(item, candidate) > nmsThreshold)) continue;
+            selected.Add(candidate);
+            if (selected.Count == maximumDetections) break;
+        }
+        return selected;
+    }
+
+    private static float IntersectionOverUnion(AnalysisDetection left, AnalysisDetection right)
+    {
+        var intersectionWidth = MathF.Max(0, MathF.Min(left.X2, right.X2) - MathF.Max(left.X1, right.X1));
+        var intersectionHeight = MathF.Max(0, MathF.Min(left.Y2, right.Y2) - MathF.Max(left.Y1, right.Y1));
+        var intersection = intersectionWidth * intersectionHeight;
+        var union = (left.X2 - left.X1) * (left.Y2 - left.Y1) +
+            (right.X2 - right.X1) * (right.Y2 - right.Y1) - intersection;
+        return union <= 0 ? 0 : intersection / union;
     }
 
     public void Dispose()

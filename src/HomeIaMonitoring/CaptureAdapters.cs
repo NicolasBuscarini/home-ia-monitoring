@@ -14,6 +14,44 @@ public interface ISegmentCaptureAdapter
     IAsyncEnumerable<CapturedSegment> CaptureAsync(string workDirectory, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// HLS segment output shared by the capture adapters. Timestamps must stay monotonic across
+/// segments because native HLS players (iOS/Safari) reject a timeline that restarts without an
+/// explicit EXT-X-DISCONTINUITY; epoch changes are signaled by the playlist instead.
+/// </summary>
+internal static class LiveSegmentMuxer
+{
+    public static IReadOnlyList<string> Arguments(string segmentSeconds, string output) =>
+    [
+        "-f", "segment",
+        "-segment_time", segmentSeconds,
+        "-segment_format", "mpegts",
+        output
+    ];
+}
+
+/// <summary>
+/// RTSP segmenting command. Extracted so tests can assert the HLS continuity contract.
+/// </summary>
+internal static class RtspSegmentCommand
+{
+    public static List<string> Arguments(string rtspUrl, bool audioEnabled, string segmentSeconds, string output)
+    {
+        var arguments = new List<string>
+        {
+            "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-rtsp_transport", "tcp",
+            "-i", rtspUrl,
+            "-map", "0:v:0"
+        };
+        if (audioEnabled) arguments.AddRange(["-map", "0:a:0?", "-c:a", "aac", "-b:a", "64k", "-ar", "16000", "-ac", "1"]);
+        else arguments.Add("-an");
+        arguments.AddRange(["-c:v", "copy"]);
+        arguments.AddRange(LiveSegmentMuxer.Arguments(segmentSeconds, output));
+        return arguments;
+    }
+}
+
 public sealed class SyntheticSegmentCaptureAdapter(CaptureOptions options) : ISegmentCaptureAdapter
 {
     public string Name => "synthetic-video-test-pattern";
@@ -34,16 +72,16 @@ public sealed class SyntheticSegmentCaptureAdapter(CaptureOptions options) : ISe
             RedirectStandardOutput = true,
             CreateNoWindow = true
         };
-        foreach (var argument in new[]
-                 {
-                     "-nostdin", "-hide_banner", "-loglevel", "error",
-                     "-re", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=15",
-                     "-map", "0:v:0", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-                     "-profile:v", "baseline", "-level:v", "3.0", "-pix_fmt", "yuv420p",
-                     "-g", "15", "-keyint_min", "15", "-sc_threshold", "0",
-                     "-f", "segment", "-segment_time", options.SegmentSecondsInvariant,
-                     "-segment_format", "mpegts", output
-                 }) startInfo.ArgumentList.Add(argument);
+        var arguments = new List<string>
+        {
+            "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-re", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=15",
+            "-map", "0:v:0", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-profile:v", "baseline", "-level:v", "3.0", "-pix_fmt", "yuv420p",
+            "-g", "15", "-keyint_min", "15", "-sc_threshold", "0"
+        };
+        arguments.AddRange(LiveSegmentMuxer.Arguments(options.SegmentSecondsInvariant, output));
+        foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
 
         using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
         if (!process.Start()) throw new InvalidOperationException("synthetic_ffmpeg_start_failed");
@@ -139,21 +177,9 @@ public sealed class FfmpegRtspCaptureAdapter(CaptureOptions options) : ISegmentC
             RedirectStandardOutput = true,
             CreateNoWindow = true
         };
-        var arguments = new List<string>
-        {
-            "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-rtsp_transport", "tcp",
-            "-i", options.RtspUrl ?? throw new InvalidOperationException("capture_rtsp_url_missing"),
-            "-map", "0:v:0"
-        };
-        if (options.AudioEnabled) arguments.AddRange(["-map", "0:a:0?", "-c:a", "aac", "-b:a", "64k", "-ar", "16000", "-ac", "1"]);
-        else arguments.Add("-an");
-        arguments.AddRange(
-        [
-            "-c:v", "copy",
-            "-f", "segment", "-segment_time", options.SegmentSecondsInvariant,
-            "-segment_format", "mpegts", "-reset_timestamps", "1", output
-        ]);
+        var arguments = RtspSegmentCommand.Arguments(
+            options.RtspUrl ?? throw new InvalidOperationException("capture_rtsp_url_missing"),
+            options.AudioEnabled, options.SegmentSecondsInvariant, output);
         foreach (var argument in arguments) startInfo.ArgumentList.Add(argument);
 
         using var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };

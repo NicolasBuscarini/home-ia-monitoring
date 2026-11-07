@@ -59,8 +59,14 @@ public sealed record PreservationResult(string ClipPublicId, bool IsPreserved, l
 
 public sealed class RetentionConflictException(string code) : Exception(code);
 
-public sealed class ClipArchiveService(MonitoringOptions monitoring, ArchiveOptions options,
-    TimeProvider timeProvider)
+/// <summary>
+/// The clip cannot be archived yet because the camera retention quota cannot hold it even after
+/// expiring every unprotected copy; the clip waits instead of being archived and expired at once.
+/// </summary>
+public sealed class ArchiveQuotaWaitException() : InvalidOperationException("archive_quota_wait");
+
+public sealed class ClipArchiveService(MonitoringOptions monitoring, ArchiveOptions options, TimeProvider timeProvider,
+    RetentionStore retention, AnalysisDispatchStore analysisStore)
 {
     private const long BytesPerGiB = 1_073_741_824;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
@@ -106,12 +112,13 @@ public sealed class ClipArchiveService(MonitoringOptions monitoring, ArchiveOpti
                                                    InvalidOperationException or JsonException)
                 {
                     var attempt = clip.ArchiveAttemptCount + 1;
+                    var waitingForQuota = exception is ArchiveQuotaWaitException;
                     await PersistManifestAsync(path, clip with
                     {
-                        ArchiveStatus = "failed",
-                        ArchiveAttemptCount = attempt,
-                        ArchiveNextAttemptAt = timeProvider.GetUtcNow()
-                            .AddSeconds(Math.Min(300, Math.Pow(2, attempt))),
+                        ArchiveStatus = waitingForQuota ? "retry_wait" : "failed",
+                        ArchiveAttemptCount = waitingForQuota ? clip.ArchiveAttemptCount : attempt,
+                        ArchiveNextAttemptAt = timeProvider.GetUtcNow().AddSeconds(
+                            waitingForQuota ? 300 : Math.Min(300, Math.Pow(2, attempt))),
                         UpdatedAt = timeProvider.GetUtcNow()
                     }, cancellationToken);
                 }
@@ -138,6 +145,8 @@ public sealed class ClipArchiveService(MonitoringOptions monitoring, ArchiveOpti
         var thumbnailSize = new FileInfo(thumbnailPath).Length;
         if (mediaSize + thumbnailSize > options.MaximumClipBytes)
             throw new InvalidOperationException("archive_clip_too_large");
+        if (!await FitsCameraQuotaAsync(clip, mediaSize + thumbnailSize, cancellationToken))
+            throw new ArchiveQuotaWaitException();
 
         var cameraDirectory = Path.Combine(options.Directory, clip.CameraId);
         var target = Path.Combine(cameraDirectory, clip.ClipId);
@@ -164,6 +173,29 @@ public sealed class ClipArchiveService(MonitoringOptions monitoring, ArchiveOpti
         var (clips, bytes) = MeasureUsage(options.Directory);
         if (clips + 1 > options.MaximumClips || bytes + incomingBytes > options.MaximumBytes)
             throw new InvalidOperationException("archive_capacity_reached");
+    }
+
+    /// <summary>
+    /// Protects the camera retention quota: a new copy is only archived when it fits next to the
+    /// copies retention cannot expire (preserved or under active analysis). Otherwise the archive
+    /// would be created and expired by the retention worker in the same cycle.
+    /// </summary>
+    private async Task<bool> FitsCameraQuotaAsync(ClipManifestV1 clip, long incomingBytes,
+        CancellationToken cancellationToken)
+    {
+        var policy = await retention.GetRawPolicyAsync(clip.CameraId, cancellationToken);
+        if (policy.MaximumStorageBytes is not { } maximum) return true;
+        var preserved = await retention.GetPreservedClipIdsAsync(clip.CameraId, cancellationToken);
+        var active = await analysisStore.ListActiveClipIdsAsync(clip.CameraId, cancellationToken);
+        var protectedIds = preserved.Concat(active).ToHashSet(StringComparer.Ordinal);
+        long protectedBytes = 0;
+        var cameraDirectory = Path.Combine(options.Directory, clip.CameraId);
+        if (Directory.Exists(cameraDirectory))
+            foreach (var directory in Directory.EnumerateDirectories(cameraDirectory))
+                if (TryReadArchive(directory, out var entry) && entry is not null &&
+                    entry.CameraId == clip.CameraId && protectedIds.Contains(entry.ClipId))
+                    protectedBytes += entry.MediaSizeBytes + entry.ThumbnailSizeBytes;
+        return protectedBytes + incomingBytes <= maximum;
     }
 
     private async Task<ArchivedClipManifestV1?> ReadArchiveAsync(string directory,

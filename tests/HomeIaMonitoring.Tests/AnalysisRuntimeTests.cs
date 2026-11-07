@@ -13,6 +13,66 @@ namespace HomeIaMonitoring.Tests;
 public sealed class AnalysisRuntimeTests
 {
     [Fact]
+    public void Yolox_decoder_maps_raw_rows_and_applies_class_nms()
+    {
+        const int width = 416;
+        const int height = 416;
+        var values = new float[3549 * 85];
+        WriteYoloxRow(values, row: 0, x: 0.5f, y: 0.5f, boxWidth: 32, boxHeight: 32, score: 0.9f);
+        WriteYoloxRow(values, row: 1, x: 0.5f, y: 0.5f, boxWidth: 32, boxHeight: 32, score: 0.8f);
+
+        var detections = OnnxAnalysisDetector.DecodeYolox(values, width, height, 0.35f, 0.45f,
+            AnalysisDetectorOptions.CocoLabels, 256);
+
+        var detection = Assert.Single(detections);
+        Assert.Equal("person", detection.ClassName);
+        Assert.Equal(0.9f, detection.Score, 3);
+        Assert.Equal(0, detection.X1, 3);
+        Assert.Equal(0.0481f, detection.X2, 3);
+    }
+
+    [Fact]
+    public void Detector_options_read_the_documented_onnx_io_keys_and_expand_coco_labels()
+    {
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["MONITORING_DETECTOR_ONNX_MODEL_PATH"] = "/models/yolox_nano.onnx",
+            ["MONITORING_DETECTOR_ONNX_INPUT_NAME"] = "images",
+            ["MONITORING_DETECTOR_ONNX_OUTPUT_NAME"] = "output",
+            ["MONITORING_DETECTOR_ADAPTER"] = "yolox",
+            ["MONITORING_DETECTOR_LABELS"] = "coco",
+            ["MONITORING_DETECTOR_INPUT_WIDTH"] = "416",
+            ["MONITORING_DETECTOR_INPUT_HEIGHT"] = "416"
+        }).Build();
+
+        var options = AnalysisDetectorOptions.FromConfiguration(configuration);
+
+        Assert.Equal("images", options.InputName);
+        Assert.Equal("output", options.OutputName);
+        Assert.Equal(80, options.Labels.Length);
+        Assert.Equal("person", options.Labels[0]);
+    }
+
+    [Fact]
+    public void Yolox_decoder_rejects_a_flat_contract_output()
+    {
+        Assert.Throws<InvalidDataException>(() => OnnxAnalysisDetector.DecodeYolox(
+            new float[6], 416, 416, 0.35f, 0.45f, AnalysisDetectorOptions.CocoLabels, 256));
+    }
+
+    private static void WriteYoloxRow(float[] values, int row, float x, float y, float boxWidth, float boxHeight,
+        float score)
+    {
+        var offset = row * 85;
+        values[offset] = x;
+        values[offset + 1] = y;
+        values[offset + 2] = MathF.Log(boxWidth / 8);
+        values[offset + 3] = MathF.Log(boxHeight / 8);
+        values[offset + 4] = 1;
+        values[offset + 5] = score;
+    }
+
+    [Fact]
     public async Task Worker_persists_result_and_completes_job_with_lease()
     {
         using var spool = new TempSpool();
@@ -86,6 +146,25 @@ public sealed class AnalysisRuntimeTests
             var failed = await GetJobAsync(client, job);
             Assert.Equal("failed", failed.GetProperty("state").GetString());
         }
+    }
+
+    [Fact]
+    public async Task Failed_job_can_be_retried_with_a_new_idempotency_key()
+    {
+        using var spool = new TempSpool();
+        var frames = new FakeFrameReader { Failing = true };
+        await using var factory = Factory(spool.Path, new FakeDetector(), frames);
+        using var client = factory.CreateClient();
+        var first = await EnqueueAsync(client, "CLP000000000004");
+        var worker = factory.Services.GetRequiredService<AnalysisWorker>();
+        Assert.True(await worker.RunOnceAsync(CancellationToken.None));
+        Assert.True(await worker.RunOnceAsync(CancellationToken.None));
+        Assert.Equal("failed", (await GetJobAsync(client, first)).GetProperty("state").GetString());
+
+        var retried = await EnqueueAsync(client, "CLP000000000004");
+
+        Assert.NotEqual(first, retried);
+        Assert.Equal("analysis_pending", (await GetJobAsync(client, retried)).GetProperty("state").GetString());
     }
 
     [Fact]

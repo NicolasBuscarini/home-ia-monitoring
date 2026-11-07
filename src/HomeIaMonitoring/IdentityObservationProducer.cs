@@ -32,6 +32,7 @@ public sealed record IdentityObservationOptions(
     public const string ScanSecondsKey = "IDENTITY_OBSERVATION_PRODUCER_SCAN_SECONDS";
     public const string DisabledSource = "disabled";
     public const string SyntheticSource = "synthetic";
+    public const string OnnxSource = "onnx-yunet-sface";
     public const string Scope = "identity.observations.write";
     public const string TokenSubject = "monitoring";
     public const string Issuer = "home-ia-monitoring";
@@ -43,9 +44,9 @@ public sealed record IdentityObservationOptions(
             throw new InvalidOperationException($"{EnabledKey} deve ser true ou false.");
 
         var source = (configuration[SourceKey] ?? DisabledSource).Trim().ToLowerInvariant();
-        if (source is not (DisabledSource or SyntheticSource))
+        if (source is not (DisabledSource or SyntheticSource or OnnxSource))
             throw new InvalidOperationException(
-                $"{SourceKey} deve ser {DisabledSource} ou {SyntheticSource}; extração real não está disponível.");
+                $"{SourceKey} deve ser {DisabledSource}, {SyntheticSource} ou {OnnxSource}.");
         if (enabled && source == DisabledSource)
             throw new InvalidOperationException($"{SourceKey} não pode ser {DisabledSource} com o producer ativo.");
 
@@ -85,7 +86,7 @@ public sealed record IdentityObservationOptions(
     }
 }
 
-public sealed record ReadyClip(string PublicId, string CameraId, DateTimeOffset EndedAtUtc);
+public sealed record ReadyClip(string PublicId, string CameraId, DateTimeOffset EndedAtUtc, TimeSpan? Duration = null);
 
 public sealed record FaceObservation(
     string SchemaVersion, string ModelId, string ModelVersion, string EmbeddingSchemaVersion, int Dimensions,
@@ -219,29 +220,54 @@ public sealed class IdentityObservationProducer : IDisposable
     public async Task<int> RunOnceAsync(CancellationToken cancellationToken)
     {
         if (!options.Enabled) return 0;
-        var discovered = await clips.ListReadyAsync(
-            Math.Clamp(options.QueueCapacity * 4, 32, 512), cancellationToken);
-        foreach (var clip in discovered)
+        var free = Math.Max(0, options.QueueCapacity - queue.Reader.Count);
+        if (free > 0)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (!MarkSeen(clip.PublicId)) continue;
-            Interlocked.Increment(ref observed);
-            if (!queue.Writer.TryWrite(new ReadyClip(clip.PublicId, clip.CameraId, clip.EndedAtUtc)))
+            var discovered = await clips.ListReadyAsync(
+                Math.Clamp(options.QueueCapacity * 4, 32, 512), cancellationToken);
+            var accepted = 0;
+            foreach (var clip in discovered)
             {
-                Interlocked.Increment(ref dropped);
-                logger.LogWarning("Fila de observação de identidade cheia; clipe {ClipPublicId} descartado.",
-                    clip.PublicId);
-                continue;
-            }
+                cancellationToken.ThrowIfCancellationRequested();
+                if (accepted >= free) break;
+                if (seen.Contains(clip.PublicId)) continue;
+                if (!queue.Writer.TryWrite(new ReadyClip(clip.PublicId, clip.CameraId, clip.EndedAtUtc,
+                        clip.EndedAtUtc - clip.StartedAtUtc)))
+                {
+                    Interlocked.Increment(ref dropped);
+                    logger.LogWarning("Fila de observação de identidade cheia; clipe {ClipPublicId} descartado.",
+                        clip.PublicId);
+                    continue;
+                }
 
-            Interlocked.Increment(ref enqueued);
+                MarkSeen(clip.PublicId);
+                Interlocked.Increment(ref observed);
+                Interlocked.Increment(ref enqueued);
+                accepted++;
+            }
         }
 
         var processed = 0;
+        List<ReadyClip>? deferred = null;
         while (processed < options.QueueCapacity && queue.Reader.TryRead(out var clip))
         {
             processed++;
-            await DeliverAsync(clip, cancellationToken);
+            if (await DeliverAsync(clip, cancellationToken) == DeliveryOutcome.Throttled)
+                (deferred ??= []).Add(clip);
+        }
+
+        if (deferred is not null)
+        {
+            foreach (var clip in deferred)
+            {
+                if (!queue.Writer.TryWrite(clip))
+                {
+                    Interlocked.Increment(ref dropped);
+                    logger.LogWarning(
+                        "Fila cheia ao reenfileirar clipe {ClipPublicId}; nova tentativa no próximo ciclo.",
+                        clip.PublicId);
+                }
+            }
         }
 
         return processed;
@@ -258,14 +284,14 @@ public sealed class IdentityObservationProducer : IDisposable
         if (ownsHttpClient) httpClient.Dispose();
     }
 
-    private async Task DeliverAsync(ReadyClip clip, CancellationToken cancellationToken)
+    private async Task<DeliveryOutcome> DeliverAsync(ReadyClip clip, CancellationToken cancellationToken)
     {
         var now = timeProvider.GetUtcNow();
         if (lastByCamera.TryGetValue(clip.CameraId, out var last) &&
             now - last < TimeSpan.FromSeconds(options.MinimumIntervalSeconds))
         {
             Interlocked.Increment(ref throttled);
-            return;
+            return DeliveryOutcome.Throttled;
         }
 
         FaceObservation? observation;
@@ -281,13 +307,13 @@ public sealed class IdentityObservationProducer : IDisposable
         {
             lastError = exception.GetType().Name;
             Interlocked.Increment(ref failed);
-            return;
+            return DeliveryOutcome.Failed;
         }
 
         if (observation is null)
         {
             Interlocked.Increment(ref skipped);
-            return;
+            return DeliveryOutcome.Skipped;
         }
 
         lastByCamera[clip.CameraId] = now;
@@ -298,7 +324,7 @@ public sealed class IdentityObservationProducer : IDisposable
             {
                 lastError = "identity_token_unavailable";
                 Interlocked.Increment(ref failed);
-                return;
+                return DeliveryOutcome.Failed;
             }
 
             try
@@ -316,7 +342,7 @@ public sealed class IdentityObservationProducer : IDisposable
                     Interlocked.Increment(ref delivered);
                     lastSuccessUtc = timeProvider.GetUtcNow();
                     lastError = null;
-                    return;
+                    return DeliveryOutcome.Delivered;
                 }
 
                 lastError = $"http_{(int)response.StatusCode}";
@@ -330,7 +356,7 @@ public sealed class IdentityObservationProducer : IDisposable
                 Interlocked.Increment(ref failed);
                 logger.LogWarning("Portal recusou observação de identidade do clipe {ClipPublicId}: {Status}.",
                     clip.PublicId, (int)response.StatusCode);
-                return;
+                return DeliveryOutcome.Failed;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -349,7 +375,7 @@ public sealed class IdentityObservationProducer : IDisposable
                 Interlocked.Increment(ref failed);
                 logger.LogWarning("Falha ao enviar observação de identidade do clipe {ClipPublicId}: {Error}.",
                     clip.PublicId, lastError);
-                return;
+                return DeliveryOutcome.Failed;
             }
         }
     }
@@ -364,6 +390,14 @@ public sealed class IdentityObservationProducer : IDisposable
 
     private static bool IsRetryable(HttpStatusCode status) =>
         status is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests || (int)status >= 500;
+
+    private enum DeliveryOutcome
+    {
+        Delivered,
+        Skipped,
+        Throttled,
+        Failed
+    }
 
     private static TimeSpan Backoff(int attempt) =>
         TimeSpan.FromMilliseconds(Math.Min(2_000, 200 * (1 << Math.Min(attempt - 1, 4))));

@@ -6,4 +6,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.ML.OnnxRuntime" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="HomeIaMonitoring.Tests" />
+  </ItemGroup>
 </Project>

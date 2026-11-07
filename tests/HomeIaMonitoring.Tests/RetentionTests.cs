@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using HomeIaMonitoring;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
@@ -142,6 +143,45 @@ public sealed class RetentionTests
     }
 
     [Fact]
+    public async Task Archive_worker_waits_when_the_camera_quota_cannot_hold_the_new_clip()
+    {
+        using var spool = new TempRetentionSpool();
+        var protectedClip = await spool.WriteClipAsync("garage-01", DateTimeOffset.UtcNow.AddDays(-20));
+        await spool.WriteRawPolicyAsync("garage-01", retentionDays: 3650, maximumStorageBytes: 4096);
+        await using var factory = Factory(spool);
+        using var client = factory.CreateClient();
+        var archive = factory.Services.GetRequiredService<ClipArchiveService>();
+        Assert.True(await archive.RunOnceAsync(CancellationToken.None));
+        using var preserved = await client.PutAsJsonAsync(
+            $"/api/v1/monitoring/retention/clips/{protectedClip.PublicId}/preservation",
+            new { expectedVersion = 0, isPreserved = true });
+        Assert.Equal(HttpStatusCode.OK, preserved.StatusCode);
+
+        var incoming = await spool.WriteClipAsync("garage-01", DateTimeOffset.UtcNow);
+        Assert.False(await archive.RunOnceAsync(CancellationToken.None));
+
+        Assert.False(Directory.Exists(spool.ArchiveDirectory("garage-01", incoming)));
+        var manifest = spool.ReadManifest(incoming);
+        Assert.Equal("retry_wait", manifest.GetProperty("archiveStatus").GetString());
+        Assert.Equal(0, manifest.GetProperty("archiveAttemptCount").GetInt32());
+        Assert.True(manifest.GetProperty("archiveNextAttemptAt").GetDateTimeOffset() > DateTimeOffset.UtcNow);
+        Assert.True(File.Exists(spool.ArchiveManifest("garage-01", protectedClip)));
+
+        using var released = await client.PutAsJsonAsync(
+            $"/api/v1/monitoring/retention/clips/{protectedClip.PublicId}/preservation",
+            new { expectedVersion = 1, isPreserved = false });
+        Assert.Equal(HttpStatusCode.OK, released.StatusCode);
+        spool.RewindArchiveRetry(incoming);
+        Assert.True(await archive.RunOnceAsync(CancellationToken.None));
+        Assert.Equal("archived", spool.ReadManifest(incoming).GetProperty("archiveStatus").GetString());
+
+        var worker = factory.Services.GetRequiredService<ClipRetentionWorker>();
+        await worker.RunOnceAsync(CancellationToken.None);
+        Assert.False(Directory.Exists(spool.ArchiveDirectory("garage-01", protectedClip)));
+        Assert.True(File.Exists(spool.ArchiveManifest("garage-01", incoming)));
+    }
+
+    [Fact]
     public async Task Preservation_requires_an_archived_ready_clip_and_valid_public_id()
     {
         using var spool = new TempRetentionSpool();
@@ -228,6 +268,14 @@ public sealed class RetentionTests
         public JsonElement ReadManifest(ClipStub clip) =>
             JsonDocument.Parse(File.ReadAllText(Path.Combine(_manifestDirectory, clip.ClipId + ".json")))
                 .RootElement.Clone();
+
+        public void RewindArchiveRetry(ClipStub clip)
+        {
+            var path = Path.Combine(_manifestDirectory, clip.ClipId + ".json");
+            var node = JsonNode.Parse(File.ReadAllText(path))!.AsObject();
+            node["archiveNextAttemptAt"] = DateTimeOffset.UtcNow.AddMinutes(-1).ToString("O");
+            File.WriteAllText(path, node.ToJsonString(new JsonSerializerOptions(JsonSerializerDefaults.Web)));
+        }
 
         public async Task<ClipStub> WriteClipAsync(string cameraId, DateTimeOffset startedAt)
         {

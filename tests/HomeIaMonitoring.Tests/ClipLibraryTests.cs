@@ -65,6 +65,52 @@ public sealed class ClipLibraryTests
     }
 
     [Fact]
+    public async Task Clips_can_be_filtered_by_analysis_state()
+    {
+        using var spool = new TempClipSpool();
+        var completed = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow.AddHours(-5));
+        var failed = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow.AddHours(-4));
+        var pending = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow.AddHours(-3));
+        var untouched = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow.AddHours(-2));
+        await using var factory = Factory(spool.Path);
+        using var client = factory.CreateClient();
+        var store = factory.Services.GetRequiredService<AnalysisDispatchStore>();
+
+        async Task EnqueueAsync(ClipStub clip) =>
+            await store.EnqueueAsync(new AnalysisEnqueueRequest(clip.ClipId, clip.PublicId, "garage-01", "garage",
+                Guid.NewGuid(), "default", "manual"), CancellationToken.None);
+
+        await EnqueueAsync(completed);
+        var completedLease = await store.ClaimNextWithLeaseAsync(CancellationToken.None);
+        Assert.NotNull(completedLease);
+        await store.CompleteAsync(completedLease.Value.Job.PublicId, completedLease.Value.LeaseId, "completed",
+            new string('a', 64), null, CancellationToken.None);
+
+        await EnqueueAsync(failed);
+        var failedLease = await store.ClaimNextWithLeaseAsync(CancellationToken.None);
+        Assert.NotNull(failedLease);
+        await store.FailAsync(failedLease.Value.Job.PublicId, failedLease.Value.LeaseId, "model_failure", false,
+            CancellationToken.None);
+
+        await EnqueueAsync(pending);
+
+        async Task<string[]> FilterAsync(string filter)
+        {
+            using var response = await client.GetAsync(
+                $"/api/v1/monitoring/clips?cameraIds=garage-01&analysis={filter}");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            var page = await response.Content.ReadFromJsonAsync<ClipLibraryPage>();
+            return page!.Items.Select(item => item.PublicId!).OrderBy(id => id, StringComparer.Ordinal).ToArray();
+        }
+
+        Assert.Equal(new[] { completed.PublicId }, await FilterAsync("completed"));
+        Assert.Equal(new[] { failed.PublicId }, await FilterAsync("failed"));
+        Assert.Equal(new[] { pending.PublicId }, await FilterAsync("pending"));
+        Assert.Equal(new[] { untouched.PublicId }, await FilterAsync("not_performed"));
+        Assert.Equal(3, (await FilterAsync("performed")).Length);
+    }
+
+    [Fact]
     public async Task Clips_can_be_sorted_and_filtered_by_preservation()
     {
         using var spool = new TempClipSpool();
@@ -167,6 +213,70 @@ public sealed class ClipLibraryTests
                 })));
 
     private sealed record ClipStub(string ClipId, string PublicId, string ThumbnailFileName);
+
+    [Fact]
+    public async Task Ready_clip_can_be_deleted_but_preserved_clip_is_refused()
+    {
+        using var spool = new TempClipSpool();
+        var clip = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow);
+        await using var factory = Factory(spool.Path);
+        using var client = factory.CreateClient();
+        var manifest = System.IO.Path.Combine(spool.Path, "clips", "manifests", clip.ClipId + ".json");
+        var media = System.IO.Path.Combine(spool.Path, "clips", "media", clip.ClipId + ".mp4");
+
+        using var deleted = await client.DeleteAsync($"/api/v1/monitoring/clips/{clip.PublicId}");
+        Assert.Equal(HttpStatusCode.NoContent, deleted.StatusCode);
+        Assert.False(File.Exists(manifest));
+        Assert.False(File.Exists(media));
+        Assert.Equal(HttpStatusCode.NotFound,
+            (await client.GetAsync($"/api/v1/monitoring/clips/{clip.PublicId}")).StatusCode);
+
+        var preserved = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow,
+            archiveStatus: "archived");
+        await factory.Services.GetRequiredService<RetentionStore>()
+            .SetPreservationAsync(preserved.PublicId, 0, isPreserved: true, CancellationToken.None);
+        using var refused = await client.DeleteAsync($"/api/v1/monitoring/clips/{preserved.PublicId}");
+        Assert.Equal(HttpStatusCode.Conflict, refused.StatusCode);
+        Assert.Contains("clip_preserved", await refused.Content.ReadAsStringAsync());
+        Assert.True(File.Exists(System.IO.Path.Combine(spool.Path, "clips", "manifests",
+            preserved.ClipId + ".json")));
+    }
+
+    [Fact]
+    public async Task DeleteAll_removes_ready_clips_but_keeps_preserved_archived_and_incomplete()
+    {
+        using var spool = new TempClipSpool();
+        var first = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow);
+        var second = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow);
+        var incomplete = await spool.WriteClipAsync("garage-01", "collecting", DateTimeOffset.UtcNow);
+        var archived = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow,
+            archiveStatus: "archived");
+        var preserved = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow,
+            archiveStatus: "archived");
+        await using var factory = Factory(spool.Path);
+        using var client = factory.CreateClient();
+        await factory.Services.GetRequiredService<RetentionStore>()
+            .SetPreservationAsync(preserved.PublicId, 0, isPreserved: true, CancellationToken.None);
+
+        using var response = await client.PostAsync("/api/v1/monitoring/clips/delete-all", null);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadAsStringAsync();
+        Assert.Contains("\"deleted\":2", body);
+        Assert.Contains("\"skippedPreserved\":1", body);
+        Assert.Contains("\"skippedArchived\":1", body);
+        Assert.Contains("\"skippedNotReady\":1", body);
+        Assert.Contains("\"skippedActiveAnalysis\":0", body);
+        Assert.Contains("\"failed\":0", body);
+        Assert.False(File.Exists(Manifest(spool.Path, first)));
+        Assert.False(File.Exists(Manifest(spool.Path, second)));
+        Assert.True(File.Exists(Manifest(spool.Path, incomplete)));
+        Assert.True(File.Exists(Manifest(spool.Path, archived)));
+        Assert.True(File.Exists(Manifest(spool.Path, preserved)));
+
+        static string Manifest(string root, ClipStub clip) =>
+            System.IO.Path.Combine(root, "clips", "manifests", clip.ClipId + ".json");
+    }
 
     private sealed class TempClipSpool : IDisposable
     {

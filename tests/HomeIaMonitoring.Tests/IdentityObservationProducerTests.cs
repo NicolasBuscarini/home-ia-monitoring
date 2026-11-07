@@ -109,6 +109,45 @@ public sealed class IdentityObservationProducerTests
     }
 
     [Fact]
+    public async Task QueueCapacityDoesNotDiscardClipsThatWereNotYetProcessed()
+    {
+        var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.Created));
+        var clips = Enumerable.Range(1, 5).Select(index => Clip($"CLP{index:D12}")).ToArray();
+        var producer = new IdentityObservationProducer(
+            Options(queueCapacity: 2, minimumIntervalSeconds: 0), new FakeClips(clips),
+            new SyntheticFaceObservationSource(), new ManualTimeProvider(),
+            NullLogger<IdentityObservationProducer>.Instance, new HttpClient(handler));
+
+        for (var cycle = 0; cycle < 3; cycle++)
+            await producer.RunOnceAsync(CancellationToken.None);
+
+        var status = producer.GetStatus();
+        Assert.Equal(5, status.Observed);
+        Assert.Equal(5, status.Delivered);
+        Assert.Equal(0, status.Dropped);
+        Assert.Equal(0, status.Pending);
+    }
+
+    [Fact]
+    public async Task ThrottledClipIsRetriedAfterTheIntervalInsteadOfBeingLost()
+    {
+        var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.Created));
+        var time = new ManualTimeProvider();
+        var producer = new IdentityObservationProducer(Options(),
+            new FakeClips([Clip("CLP000000000001"), Clip("CLP000000000002")]),
+            new SyntheticFaceObservationSource(), time,
+            NullLogger<IdentityObservationProducer>.Instance, new HttpClient(handler));
+
+        await producer.RunOnceAsync(CancellationToken.None);
+        Assert.Equal(1, producer.GetStatus().Delivered);
+        Assert.Equal(1, producer.GetStatus().Throttled);
+
+        time.Now = Now.AddSeconds(61);
+        await producer.RunOnceAsync(CancellationToken.None);
+        Assert.Equal(2, producer.GetStatus().Delivered);
+    }
+
+    [Fact]
     public void RejectsUnsupportedOrIncompleteConfiguration()
     {
         Assert.Throws<InvalidOperationException>(() => Configuration(new()
@@ -141,9 +180,10 @@ public sealed class IdentityObservationProducerTests
         IdentityObservationOptions.FromConfiguration(new ConfigurationBuilder()
             .AddInMemoryCollection(values).Build());
 
-    private static IdentityObservationOptions Options() => new(true, "synthetic", "http://portal.test",
-        "0123456789012345678901234567890123456789", "home-ia-portal", "home", 60, 8, 3,
-        TimeSpan.FromSeconds(2), 30);
+    private static IdentityObservationOptions Options(int queueCapacity = 8,
+        int minimumIntervalSeconds = 60) => new(true, "synthetic", "http://portal.test",
+        "0123456789012345678901234567890123456789", "home-ia-portal", "home",
+        minimumIntervalSeconds, queueCapacity, 3, TimeSpan.FromSeconds(2), 30);
 
     private static IdentityObservationProducer Producer(StubHandler handler, params ClipLibraryItem[] clips) =>
         new(Options(), new FakeClips(clips), new SyntheticFaceObservationSource(), new ManualTimeProvider(),
@@ -163,6 +203,8 @@ public sealed class IdentityObservationProducerTests
 
     private sealed class ManualTimeProvider : TimeProvider
     {
+        public DateTimeOffset Now { get; set; } = IdentityObservationProducerTests.Now;
+
         public override DateTimeOffset GetUtcNow() => Now;
     }
 
