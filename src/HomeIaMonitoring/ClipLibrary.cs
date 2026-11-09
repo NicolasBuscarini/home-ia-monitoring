@@ -36,6 +36,14 @@ public sealed record ClipLibraryItem(string PublicId, string ClipId, string Came
 
 public sealed record ClipLibraryPage(IReadOnlyList<ClipLibraryItem> Items, int Page, int PageSize, int Total);
 
+/// <summary>
+/// Página de varredura do spool. <see cref="NextOffset"/> avança sobre os manifests na ordem
+/// estável de escrita (mais recentes primeiro) e <see cref="HasMore"/> indica que a varredura
+/// ainda não terminou. O offset existe para consumidores de fundo percorrerem todo o spool sem
+/// reler os mesmos manifests a cada ciclo.
+/// </summary>
+public sealed record ClipScanPage(IReadOnlyList<ClipLibraryItem> Items, int NextOffset, bool HasMore);
+
 public enum ClipDeleteStatus { Deleted, NotFound, NotReady, Preserved, Archived, Failed }
 
 public sealed record ClipDeleteResult(ClipDeleteStatus Status, string? Error = null);
@@ -52,10 +60,11 @@ public interface IClipPlaybackSource
     Task<ClipLibraryItem?> GetAsync(string publicId, CancellationToken cancellationToken);
 
     /// <summary>
-    /// Clipes <c>ready</c> mais recentes para consumidores de fundo. Confirma somente estado e
-    /// presença do arquivo de mídia; não relê bytes nem valida o hash a cada varredura.
+    /// Página de clipes <c>ready</c> para consumidores de fundo, avançando pelo spool na ordem
+    /// de escrita (mais recentes primeiro). Confirma somente estado e presença do arquivo de
+    /// mídia; não relê bytes nem valida o hash a cada varredura.
     /// </summary>
-    Task<IReadOnlyList<ClipLibraryItem>> ListReadyAsync(int take, CancellationToken cancellationToken);
+    Task<ClipScanPage> ListReadyPageAsync(int take, int offset, CancellationToken cancellationToken);
     Task<string?> GetPlaybackPathAsync(string publicId, CancellationToken cancellationToken);
 }
 
@@ -154,22 +163,27 @@ public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions cap
         return new(items, page, pageSize, orderedArray.Length);
     }
 
-    public async Task<IReadOnlyList<ClipLibraryItem>> ListReadyAsync(int take,
+    public async Task<ClipScanPage> ListReadyPageAsync(int take, int offset,
         CancellationToken cancellationToken)
     {
-        if (take < 1) return [];
+        if (take < 1) return new([], Math.Max(0, offset), false);
+        offset = Math.Max(0, offset);
         var items = new List<ClipLibraryItem>(Math.Min(take, 64));
+        var examined = 0;
+        var index = 0;
         foreach (var path in EnumerateManifestPaths())
         {
+            if (index++ < offset) continue;
+            examined++;
             cancellationToken.ThrowIfCancellationRequested();
             var clip = await ReadManifestAsync(path, cancellationToken);
             if (clip is null || clip.State != "ready") continue;
             if (Resolve("media", clip.MediaFileName, clip.MediaSha256) is null) continue;
             items.Add(Map(clip));
-            if (items.Count >= take) break;
+            if (items.Count >= take) return new(items, offset + examined, true);
         }
 
-        return items;
+        return new(items, offset + examined, false);
     }
 
     public async Task<ClipLibraryItem?> GetAsync(string publicId, CancellationToken cancellationToken)
@@ -425,7 +439,6 @@ public sealed class ClipLibrary(MonitoringOptions monitoring, CaptureOptions cap
             .Select(path => new FileInfo(path))
             .OrderByDescending(file => file.LastWriteTimeUtc)
             .ThenByDescending(file => file.Name, StringComparer.Ordinal)
-            .Take(10_000)
             .Select(file => file.FullName);
     }
 

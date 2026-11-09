@@ -203,6 +203,34 @@ public sealed class ClipLibraryTests
         Assert.Contains("copy", arguments);
     }
 
+    [Fact]
+    public async Task Scan_pages_cover_the_whole_spool_without_duplicates()
+    {
+        using var spool = new TempClipSpool();
+        var first = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow.AddMinutes(-5));
+        var second = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow.AddMinutes(-4));
+        var third = await spool.WriteClipAsync("garage-01", "ready", DateTimeOffset.UtcNow.AddMinutes(-3));
+        var collecting = await spool.WriteClipAsync("garage-01", "collecting", DateTimeOffset.UtcNow.AddMinutes(-2));
+        await using var factory = Factory(spool.Path);
+        var library = factory.Services.GetRequiredService<IClipPlaybackSource>();
+
+        var ids = new List<string>();
+        var offset = 0;
+        for (var pageNumber = 0; pageNumber < 10; pageNumber++)
+        {
+            var page = await library.ListReadyPageAsync(1, offset, CancellationToken.None);
+            ids.AddRange(page.Items.Select(item => item.PublicId));
+            if (!page.HasMore) break;
+            offset = page.NextOffset;
+        }
+
+        Assert.Equal(3, ids.Count);
+        Assert.Equal(3, ids.Distinct().Count());
+        Assert.Equal(new[] { first.PublicId, second.PublicId, third.PublicId }.OrderBy(id => id, StringComparer.Ordinal),
+            ids.OrderBy(id => id, StringComparer.Ordinal));
+        Assert.DoesNotContain(collecting.PublicId, ids);
+    }
+
     private static WebApplicationFactory<Program> Factory(string spool) =>
         new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
             builder.ConfigureAppConfiguration((_, configuration) =>

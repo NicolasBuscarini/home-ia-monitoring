@@ -15,13 +15,53 @@ public sealed class FaceRecognitionTests
     ];
 
     [Fact]
-    public void Samples_frames_across_the_clip_and_respects_the_limit()
+    public void Samples_evenly_spaced_midpoints_across_the_clip()
     {
-        Assert.Equal(new[] { TimeSpan.Zero }, FfmpegFaceFrameExtractor.SamplePositions(TimeSpan.FromSeconds(0.5), 2));
+        Assert.Equal(new[] { TimeSpan.FromSeconds(0.25) },
+            FfmpegFaceFrameExtractor.SamplePositions(TimeSpan.FromSeconds(0.5), 2));
         Assert.Equal(new[] { TimeSpan.FromSeconds(5) },
             FfmpegFaceFrameExtractor.SamplePositions(TimeSpan.FromSeconds(10), 1));
-        Assert.Equal(new[] { TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(7) },
+        Assert.Equal(new[] { TimeSpan.FromSeconds(2.5), TimeSpan.FromSeconds(7.5) },
             FfmpegFaceFrameExtractor.SamplePositions(TimeSpan.FromSeconds(10), 2));
+        var six = FfmpegFaceFrameExtractor.SamplePositions(TimeSpan.FromSeconds(10), 6);
+        Assert.Equal(6, six.Count);
+        Assert.Equal(10 * 0.5 / 6, six[0].TotalSeconds, 3);
+        Assert.Equal(10 * 5.5 / 6, six[5].TotalSeconds, 3);
+        Assert.Equal(12, FfmpegFaceFrameExtractor.SamplePositions(TimeSpan.FromSeconds(10), 20).Count);
+    }
+
+    [Fact]
+    public void Accepts_wide_frames_within_the_pixel_budget()
+    {
+        Assert.True(new RgbImage(2304, 1296, new byte[2304 * 1296 * 3]).IsValid);
+        Assert.False(new RgbImage(2304, 1296, new byte[10]).IsValid);
+        Assert.False(new RgbImage(2049, 2049, new byte[2049 * 2049 * 3]).IsValid);
+    }
+
+    [Fact]
+    public void Warp_samples_the_source_image_instead_of_a_constant_black_tensor()
+    {
+        var pixels = new byte[112 * 112 * 3];
+        for (var y = 0; y < 112; y++)
+            for (var x = 0; x < 112; x++)
+            {
+                var offset = (y * 112 + x) * 3;
+                pixels[offset] = (byte)x;
+                pixels[offset + 1] = (byte)y;
+                pixels[offset + 2] = (byte)((x + y) % 256);
+            }
+        var image = new RgbImage(112, 112, pixels);
+        FacePoint[] template =
+        [
+            new(38.2946f, 51.6963f), new(73.5318f, 51.5014f), new(56.0252f, 71.7366f),
+            new(41.5493f, 92.3655f), new(70.7299f, 92.2041f)
+        ];
+
+        var tensor = FaceAlignment.Warp(image, FaceAlignment.Fit(template));
+
+        Assert.True(tensor.Distinct().Count() > 1);
+        Assert.Equal((20f - 127.5f) / 128f, tensor[10 * 112 + 20], 2);
+        Assert.Equal((10f - 127.5f) / 128f, tensor[112 * 112 + 10 * 112 + 20], 2);
     }
 
     [Fact]
@@ -66,10 +106,10 @@ public sealed class FaceRecognitionTests
     [Fact]
     public void Fits_landmarks_onto_the_reference_template()
     {
-        float[] referenceX = [38.2946f / 112, 73.5318f / 112, 56.0252f / 112, 41.5493f / 112, 70.7299f / 112];
-        float[] referenceY = [51.6963f / 112, 51.5014f / 112, 71.7366f / 112, 92.3655f / 112, 92.2041f / 112];
+        float[] referenceX = [38.2946f, 73.5318f, 56.0252f, 41.5493f, 70.7299f];
+        float[] referenceY = [51.6963f, 51.5014f, 71.7366f, 92.3655f, 92.2041f];
         var source = Enumerable.Range(0, 5)
-            .Select(index => new FacePoint(referenceX[index] * 150 + 20, referenceY[index] * 150 + 30))
+            .Select(index => new FacePoint(referenceX[index] / 112f * 150 + 20, referenceY[index] / 112f * 150 + 30))
             .ToArray();
         var transform = FaceAlignment.Fit(source);
         for (var index = 0; index < 5; index++)
@@ -78,11 +118,69 @@ public sealed class FaceRecognitionTests
                     transform.OffsetX;
             var y = transform.Scale * (transform.Sin * source[index].X + transform.Cos * source[index].Y) +
                     transform.OffsetY;
-            Assert.Equal(referenceX[index], x, 3);
-            Assert.Equal(referenceY[index], y, 3);
+            Assert.Equal(referenceX[index], x, 2);
+            Assert.Equal(referenceY[index], y, 2);
         }
         Assert.Throws<ArgumentException>(() => FaceAlignment.Fit([new FacePoint(1, 1), new FacePoint(1, 1),
             new FacePoint(1, 1), new FacePoint(1, 1), new FacePoint(1, 1)]));
+    }
+
+    [Fact]
+    public void Selects_the_largest_face_across_sampled_frames()
+    {
+        var small = BlankFrame();
+        var large = BlankFrame();
+        var detector = new StubDetector(image => image == small
+            ? [Face(10, 10, 20, 20)]
+            : [Face(30, 30, 60, 60)]);
+
+        var selected = OnnxFaceObservationSource.SelectBestFace([small, large], detector, 16);
+
+        Assert.NotNull(selected);
+        Assert.Same(large, selected!.Value.Image);
+        Assert.Equal(60, selected.Value.Face.Width);
+    }
+
+    [Fact]
+    public void Ignores_faces_with_landmarks_outside_the_frame_and_faces_below_the_minimum()
+    {
+        var outside = BlankFrame();
+        var small = BlankFrame();
+        var inside = BlankFrame();
+        var detector = new StubDetector(image => image == outside
+            ? [FaceOutside(0, 0, 80, 80)]
+            : image == small
+                ? [Face(10, 10, 10, 10)]
+                : [Face(10, 10, 40, 40)]);
+
+        var selected = OnnxFaceObservationSource.SelectBestFace([outside, small, inside], detector, 16);
+
+        Assert.NotNull(selected);
+        Assert.Same(inside, selected!.Value.Image);
+        Assert.Equal(40, selected.Value.Face.Width);
+    }
+
+    [Fact]
+    public void Returns_no_face_when_none_is_usable()
+    {
+        var image = BlankFrame();
+        var detector = new StubDetector(_ => [FaceOutside(0, 0, 80, 80)]);
+        Assert.Null(OnnxFaceObservationSource.SelectBestFace([image], detector, 16));
+    }
+
+    private static RgbImage BlankFrame() => new(112, 112, new byte[112 * 112 * 3]);
+
+    private static DetectedFace Face(float x, float y, float width, float height) =>
+        new(x, y, width, height, [new FacePoint(0, 0), new FacePoint(0, 0), new FacePoint(0, 0),
+            new FacePoint(0, 0), new FacePoint(0, 0)]);
+
+    private static DetectedFace FaceOutside(float x, float y, float width, float height) =>
+        new(x, y, width, height, [new FacePoint(200, 200), new FacePoint(200, 200), new FacePoint(200, 200),
+            new FacePoint(200, 200), new FacePoint(200, 200)]);
+
+    private sealed class StubDetector(Func<RgbImage, IReadOnlyList<DetectedFace>> detect) : IFaceDetector
+    {
+        public IReadOnlyList<DetectedFace> Detect(RgbImage image) => detect(image);
     }
 
     [Fact]
@@ -209,8 +307,8 @@ public sealed class FaceRecognitionTests
         public Task<ClipLibraryItem?> GetAsync(string publicId, CancellationToken cancellationToken) =>
             Task.FromResult<ClipLibraryItem?>(null);
 
-        public Task<IReadOnlyList<ClipLibraryItem>> ListReadyAsync(int take, CancellationToken cancellationToken) =>
-            Task.FromResult<IReadOnlyList<ClipLibraryItem>>([]);
+        public Task<ClipScanPage> ListReadyPageAsync(int take, int offset, CancellationToken cancellationToken) =>
+            Task.FromResult(new ClipScanPage([], offset, false));
 
         public Task<string?> GetPlaybackPathAsync(string publicId, CancellationToken cancellationToken) =>
             Task.FromResult<string?>(path);

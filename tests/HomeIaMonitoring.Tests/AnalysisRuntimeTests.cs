@@ -270,8 +270,8 @@ public sealed class AnalysisRuntimeTests
                 DateTimeOffset.Parse("2026-11-02T12:00:10+00:00"), "ready", "not_requested", "manual", "v1",
                 null, null, 0, DateTimeOffset.Parse("2026-11-02T12:00:10+00:00"), 1000));
 
-        public Task<IReadOnlyList<ClipLibraryItem>> ListReadyAsync(int take, CancellationToken cancellationToken) =>
-            Task.FromResult<IReadOnlyList<ClipLibraryItem>>([]);
+        public Task<ClipScanPage> ListReadyPageAsync(int take, int offset, CancellationToken cancellationToken) =>
+            Task.FromResult(new ClipScanPage([], offset, false));
 
         public Task<string?> GetPlaybackPathAsync(string publicId, CancellationToken cancellationToken) =>
             Task.FromResult<string?>("/tmp/playback.mp4");

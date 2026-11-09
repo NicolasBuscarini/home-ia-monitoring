@@ -148,6 +148,85 @@ public sealed class IdentityObservationProducerTests
     }
 
     [Fact]
+    public async Task ScansBeyondTheFormerPageLimitWithoutLosingOlderClips()
+    {
+        var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.Created));
+        var clips = Enumerable.Range(1, 300).Select(index => Clip($"CLP{index:D12}")).ToArray();
+        var producer = new IdentityObservationProducer(
+            Options(queueCapacity: 8, minimumIntervalSeconds: 0), new FakeClips(clips),
+            new SyntheticFaceObservationSource(), new ManualTimeProvider(),
+            NullLogger<IdentityObservationProducer>.Instance, new HttpClient(handler));
+
+        for (var cycle = 0; cycle < 40; cycle++)
+            await producer.RunOnceAsync(CancellationToken.None);
+
+        var status = producer.GetStatus();
+        Assert.Equal(300, status.Observed);
+        Assert.Equal(300, status.Delivered);
+        Assert.Equal(300, handler.Calls.Count);
+        Assert.True(status.Sweeps >= 1);
+    }
+
+    [Fact]
+    public async Task RetriesAFailedClipOnALaterSweep()
+    {
+        var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.Created));
+        var source = new FlakyFaceSource(new SyntheticFaceObservationSource(), failures: 1);
+        var time = new ManualTimeProvider();
+        var producer = new IdentityObservationProducer(Options(minimumIntervalSeconds: 0),
+            new FakeClips([Clip("CLP000000000001")]), source, time,
+            NullLogger<IdentityObservationProducer>.Instance, new HttpClient(handler));
+
+        await producer.RunOnceAsync(CancellationToken.None);
+        Assert.Equal(1, producer.GetStatus().Failed);
+        Assert.Equal(1, producer.GetStatus().Observed);
+
+        await producer.RunOnceAsync(CancellationToken.None);
+
+        var status = producer.GetStatus();
+        Assert.Equal(1, status.Delivered);
+        Assert.Equal(2, status.Observed);
+        Assert.Equal(2, source.Calls);
+    }
+
+    [Fact]
+    public async Task StopsRetryingAClipAfterTheConfiguredAttempts()
+    {
+        var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.Created));
+        var source = new FlakyFaceSource(new SyntheticFaceObservationSource(), failures: int.MaxValue);
+        var producer = new IdentityObservationProducer(Options(minimumIntervalSeconds: 0),
+            new FakeClips([Clip("CLP000000000001")]), source, new ManualTimeProvider(),
+            NullLogger<IdentityObservationProducer>.Instance, new HttpClient(handler));
+
+        for (var cycle = 0; cycle < 5; cycle++)
+            await producer.RunOnceAsync(CancellationToken.None);
+
+        var status = producer.GetStatus();
+        Assert.Equal(3, status.Failed);
+        Assert.Equal(3, status.Observed);
+        Assert.Equal(0, status.Delivered);
+    }
+
+    [Fact]
+    public async Task SeenRetentionExpiresAndAllowsADeliveryAfterTheRetentionWindow()
+    {
+        var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.Created));
+        var time = new ManualTimeProvider();
+        var producer = new IdentityObservationProducer(Options(minimumIntervalSeconds: 0),
+            new FakeClips([Clip("CLP000000000001")]), new SyntheticFaceObservationSource(), time,
+            NullLogger<IdentityObservationProducer>.Instance, new HttpClient(handler));
+
+        await producer.RunOnceAsync(CancellationToken.None);
+        Assert.Equal(1, producer.GetStatus().Delivered);
+
+        time.Now = Now.AddDays(8);
+        await producer.RunOnceAsync(CancellationToken.None);
+
+        Assert.Equal(2, producer.GetStatus().Delivered);
+        Assert.Equal(2, producer.GetStatus().Observed);
+    }
+
+    [Fact]
     public void RejectsUnsupportedOrIncompleteConfiguration()
     {
         Assert.Throws<InvalidOperationException>(() => Configuration(new()
@@ -176,6 +255,81 @@ public sealed class IdentityObservationProducerTests
         Assert.Equal(64, options.QueueCapacity);
     }
 
+    [Fact]
+    public async Task PersistsTheScanCursorAcrossRestarts()
+    {
+        var directory = Path.Combine(Path.GetTempPath(),
+            "home-ia-observation-state-" + Guid.NewGuid().ToString("N"));
+        var statePath = Path.Combine(directory, "scan-state.json");
+        try
+        {
+            var store = new IdentityObservationScanStateStore(statePath);
+            var clips = new FakeClips([
+                Clip("CLP000000000001"), Clip("CLP000000000002"), Clip("CLP000000000003")
+            ]);
+            var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.Created));
+
+            var first = new IdentityObservationProducer(
+                Options(queueCapacity: 1, minimumIntervalSeconds: 0), clips,
+                new SyntheticFaceObservationSource(), new ManualTimeProvider(),
+                NullLogger<IdentityObservationProducer>.Instance, new HttpClient(handler), store);
+            await first.RunOnceAsync(CancellationToken.None);
+            first.Dispose();
+
+            var second = new IdentityObservationProducer(
+                Options(queueCapacity: 1, minimumIntervalSeconds: 0), clips,
+                new SyntheticFaceObservationSource(), new ManualTimeProvider(),
+                NullLogger<IdentityObservationProducer>.Instance, new HttpClient(handler), store);
+            await second.RunOnceAsync(CancellationToken.None);
+            second.Dispose();
+
+            Assert.Equal(0, clips.Requests[0].Offset);
+            Assert.Equal(1, clips.Requests[1].Offset);
+            Assert.Equal(2, clips.Requests.Count);
+            Assert.Equal(1, second.GetStatus().Observed);
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task PersistsSeenClipsAcrossRestarts()
+    {
+        var directory = Path.Combine(Path.GetTempPath(),
+            "home-ia-observation-state-" + Guid.NewGuid().ToString("N"));
+        var statePath = Path.Combine(directory, "scan-state.json");
+        try
+        {
+            var store = new IdentityObservationScanStateStore(statePath);
+            var clips = new FakeClips([Clip("CLP000000000001")]);
+            var handler = new StubHandler(_ => new HttpResponseMessage(HttpStatusCode.Created));
+
+            var first = new IdentityObservationProducer(
+                Options(queueCapacity: 1, minimumIntervalSeconds: 0), clips,
+                new SyntheticFaceObservationSource(), new ManualTimeProvider(),
+                NullLogger<IdentityObservationProducer>.Instance, new HttpClient(handler), store);
+            await first.RunOnceAsync(CancellationToken.None);
+            first.Dispose();
+            Assert.Single(handler.Calls);
+
+            var second = new IdentityObservationProducer(
+                Options(queueCapacity: 1, minimumIntervalSeconds: 0), clips,
+                new SyntheticFaceObservationSource(), new ManualTimeProvider(),
+                NullLogger<IdentityObservationProducer>.Instance, new HttpClient(handler), store);
+            await second.RunOnceAsync(CancellationToken.None);
+            second.Dispose();
+
+            Assert.Equal(0, second.GetStatus().Observed);
+            Assert.Single(handler.Calls);
+        }
+        finally
+        {
+            if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static IdentityObservationOptions Configuration(Dictionary<string, string?> values) =>
         IdentityObservationOptions.FromConfiguration(new ConfigurationBuilder()
             .AddInMemoryCollection(values).Build());
@@ -201,6 +355,20 @@ public sealed class IdentityObservationProducerTests
         return Encoding.UTF8.GetString(Convert.FromBase64String(padded));
     }
 
+    private sealed class FlakyFaceSource(IFaceObservationSource inner, int failures) : IFaceObservationSource
+    {
+        public int Calls { get; private set; }
+
+        public string Name => inner.Name;
+
+        public Task<FaceObservation?> TryCreateAsync(ReadyClip clip, CancellationToken cancellationToken)
+        {
+            Calls++;
+            if (Calls <= failures) throw new InvalidOperationException("transient_face_source_failure");
+            return inner.TryCreateAsync(clip, cancellationToken);
+        }
+    }
+
     private sealed class ManualTimeProvider : TimeProvider
     {
         public DateTimeOffset Now { get; set; } = IdentityObservationProducerTests.Now;
@@ -210,8 +378,15 @@ public sealed class IdentityObservationProducerTests
 
     private sealed class FakeClips(ClipLibraryItem[] items) : IClipPlaybackSource
     {
-        public Task<IReadOnlyList<ClipLibraryItem>> ListReadyAsync(int take, CancellationToken cancellationToken) =>
-            Task.FromResult<IReadOnlyList<ClipLibraryItem>>(items.Take(take).ToArray());
+        public List<(int Take, int Offset)> Requests { get; } = [];
+
+        public Task<ClipScanPage> ListReadyPageAsync(int take, int offset, CancellationToken cancellationToken)
+        {
+            Requests.Add((take, offset));
+            var page = items.Skip(offset).Take(take).ToArray();
+            return Task.FromResult(new ClipScanPage(page, offset + page.Length,
+                offset + page.Length < items.Length));
+        }
 
         public Task<ClipLibraryItem?> GetAsync(string publicId, CancellationToken cancellationToken) =>
             Task.FromResult<ClipLibraryItem?>(items.FirstOrDefault(item => item.PublicId == publicId));

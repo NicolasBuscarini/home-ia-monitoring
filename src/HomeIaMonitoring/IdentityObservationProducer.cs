@@ -138,7 +138,7 @@ public sealed class SyntheticFaceObservationSource : IFaceObservationSource
 
 public sealed record IdentityObservationStatus(bool Enabled, string Source, int Pending, int Capacity,
     long Observed, long Enqueued, long Dropped, long Throttled, long Skipped, long Delivered, long Failed,
-    long Retried, DateTimeOffset? LastSuccessUtc, string? LastError);
+    long Retried, int Seen, int ScanOffset, long Sweeps, DateTimeOffset? LastSuccessUtc, string? LastError);
 
 public static class IdentityObservationMetrics
 {
@@ -162,6 +162,12 @@ public static class IdentityObservationMetrics
         $"home_ia_identity_observations_failed_total {status.Failed}",
         "# TYPE home_ia_identity_observations_retried_total counter",
         $"home_ia_identity_observations_retried_total {status.Retried}",
+        "# TYPE home_ia_identity_observations_seen gauge",
+        $"home_ia_identity_observations_seen {status.Seen}",
+        "# TYPE home_ia_identity_observations_scan_offset gauge",
+        $"home_ia_identity_observations_scan_offset {status.ScanOffset}",
+        "# TYPE home_ia_identity_observations_sweeps_total counter",
+        $"home_ia_identity_observations_sweeps_total {status.Sweeps}",
         string.Empty);
 }
 
@@ -173,7 +179,8 @@ public static class IdentityObservationMetrics
 public sealed class IdentityObservationProducer : IDisposable
 {
     private const int TokenLifetimeSeconds = 60;
-    private const int SeenCapacity = 4_096;
+    private static readonly TimeSpan SeenRetention = TimeSpan.FromDays(7);
+    private static readonly TimeSpan SeenPruneInterval = TimeSpan.FromMinutes(5);
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly IdentityObservationOptions options;
     private readonly IClipPlaybackSource clips;
@@ -183,9 +190,13 @@ public sealed class IdentityObservationProducer : IDisposable
     private readonly HttpClient httpClient;
     private readonly bool ownsHttpClient;
     private readonly Channel<ReadyClip> queue;
-    private readonly HashSet<string> seen = new(StringComparer.Ordinal);
-    private readonly Queue<string> seenOrder = new();
+    private readonly IdentityObservationScanStateStore? stateStore;
+    private readonly Dictionary<string, DateTimeOffset> seen = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> failedAttempts = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTimeOffset> lastByCamera = new(StringComparer.Ordinal);
+    private int scanOffset;
+    private long sweeps;
+    private DateTimeOffset? lastSeenPruneUtc;
     private long observed;
     private long enqueued;
     private long dropped;
@@ -199,13 +210,14 @@ public sealed class IdentityObservationProducer : IDisposable
 
     public IdentityObservationProducer(IdentityObservationOptions options, IClipPlaybackSource clips,
         IFaceObservationSource source, TimeProvider timeProvider, ILogger<IdentityObservationProducer> logger,
-        HttpClient? httpClient = null)
+        HttpClient? httpClient = null, IdentityObservationScanStateStore? stateStore = null)
     {
         this.options = options;
         this.clips = clips;
         this.source = source;
         this.timeProvider = timeProvider;
         this.logger = logger;
+        this.stateStore = stateStore;
         ownsHttpClient = httpClient is null;
         this.httpClient = httpClient ?? new HttpClient();
         this.httpClient.Timeout = options.HttpTimeout;
@@ -215,22 +227,51 @@ public sealed class IdentityObservationProducer : IDisposable
             SingleReader = true,
             SingleWriter = false
         });
+
+        var persisted = stateStore?.Load();
+        if (persisted is not null)
+        {
+            scanOffset = persisted.ScanOffset;
+            sweeps = persisted.Sweeps;
+            foreach (var pair in persisted.Seen) seen[pair.Key] = pair.Value;
+            foreach (var pair in persisted.FailedAttempts) failedAttempts[pair.Key] = pair.Value;
+            logger.LogInformation(
+                "Estado de varredura de observação facial retomado: offset={Offset}, ciclos={Sweeps}, vistos={Seen}.",
+                scanOffset, sweeps, seen.Count);
+        }
     }
 
     public async Task<int> RunOnceAsync(CancellationToken cancellationToken)
     {
         if (!options.Enabled) return 0;
+        var now = timeProvider.GetUtcNow();
+        PruneSeen(now);
         var free = Math.Max(0, options.QueueCapacity - queue.Reader.Count);
         if (free > 0)
         {
-            var discovered = await clips.ListReadyAsync(
-                Math.Clamp(options.QueueCapacity * 4, 32, 512), cancellationToken);
+            var page = await clips.ListReadyPageAsync(free, scanOffset, cancellationToken);
+            if (page.HasMore)
+            {
+                scanOffset = page.NextOffset;
+            }
+            else
+            {
+                scanOffset = 0;
+                Interlocked.Increment(ref sweeps);
+            }
+
             var accepted = 0;
-            foreach (var clip in discovered)
+            foreach (var clip in page.Items)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (accepted >= free) break;
-                if (seen.Contains(clip.PublicId)) continue;
+                if (seen.TryGetValue(clip.PublicId, out var seenAt))
+                {
+                    if (now - seenAt < SeenRetention) continue;
+                    seen.Remove(clip.PublicId);
+                    failedAttempts.Remove(clip.PublicId);
+                }
+
                 if (!queue.Writer.TryWrite(new ReadyClip(clip.PublicId, clip.CameraId, clip.EndedAtUtc,
                         clip.EndedAtUtc - clip.StartedAtUtc)))
                 {
@@ -240,20 +281,29 @@ public sealed class IdentityObservationProducer : IDisposable
                     continue;
                 }
 
-                MarkSeen(clip.PublicId);
+                MarkSeen(clip.PublicId, now);
                 Interlocked.Increment(ref observed);
                 Interlocked.Increment(ref enqueued);
                 accepted++;
             }
         }
 
+        // Persiste cursor/seen logo após a leitura da página: a extração de frames pode levar
+        // minutos por ciclo e um restart no meio não deve perder a página já enfileirada.
+        stateStore?.Save(CaptureState());
+
         var processed = 0;
         List<ReadyClip>? deferred = null;
         while (processed < options.QueueCapacity && queue.Reader.TryRead(out var clip))
         {
             processed++;
-            if (await DeliverAsync(clip, cancellationToken) == DeliveryOutcome.Throttled)
+            var outcome = await DeliverAsync(clip, cancellationToken);
+            if (outcome == DeliveryOutcome.Throttled)
                 (deferred ??= []).Add(clip);
+            else if (outcome == DeliveryOutcome.Failed)
+                NoteFailure(clip);
+            else
+                failedAttempts.Remove(clip.PublicId);
         }
 
         if (deferred is not null)
@@ -270,17 +320,25 @@ public sealed class IdentityObservationProducer : IDisposable
             }
         }
 
+        stateStore?.Save(CaptureState());
         return processed;
     }
+
+    private IdentityObservationScanState CaptureState() =>
+        new(scanOffset, Interlocked.Read(ref sweeps),
+            new Dictionary<string, DateTimeOffset>(seen, StringComparer.Ordinal),
+            new Dictionary<string, int>(failedAttempts, StringComparer.Ordinal));
 
     public IdentityObservationStatus GetStatus() => new(options.Enabled, options.Source,
         queue.Reader.Count, options.QueueCapacity, Interlocked.Read(ref observed),
         Interlocked.Read(ref enqueued), Interlocked.Read(ref dropped), Interlocked.Read(ref throttled),
         Interlocked.Read(ref skipped), Interlocked.Read(ref delivered), Interlocked.Read(ref failed),
-        Interlocked.Read(ref retried), lastSuccessUtc, lastError);
+        Interlocked.Read(ref retried), seen.Count, scanOffset, Interlocked.Read(ref sweeps),
+        lastSuccessUtc, lastError);
 
     public void Dispose()
     {
+        stateStore?.Save(CaptureState());
         if (ownsHttpClient) httpClient.Dispose();
     }
 
@@ -356,7 +414,7 @@ public sealed class IdentityObservationProducer : IDisposable
                 Interlocked.Increment(ref failed);
                 logger.LogWarning("Portal recusou observação de identidade do clipe {ClipPublicId}: {Status}.",
                     clip.PublicId, (int)response.StatusCode);
-                return DeliveryOutcome.Failed;
+                return DeliveryOutcome.Rejected;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -380,12 +438,30 @@ public sealed class IdentityObservationProducer : IDisposable
         }
     }
 
-    private bool MarkSeen(string publicId)
+    private void MarkSeen(string publicId, DateTimeOffset now) => seen[publicId] = now;
+
+    /// <summary>
+    /// Um clipe que falhou pode voltar numa varredura futura, mas no máximo
+    /// <see cref="IdentityObservationOptions.MaximumAttempts"/> vezes. Ao esgotar, permanece em
+    /// <c>seen</c> até a retenção expirar para não gerar laço quente.
+    /// </summary>
+    private void NoteFailure(ReadyClip clip)
     {
-        if (!seen.Add(publicId)) return false;
-        seenOrder.Enqueue(publicId);
-        while (seenOrder.Count > SeenCapacity) seen.Remove(seenOrder.Dequeue());
-        return true;
+        var attempts = failedAttempts.TryGetValue(clip.PublicId, out var current) ? current + 1 : 1;
+        failedAttempts[clip.PublicId] = attempts;
+        if (attempts < options.MaximumAttempts) seen.Remove(clip.PublicId);
+    }
+
+    private void PruneSeen(DateTimeOffset now)
+    {
+        if (seen.Count == 0) return;
+        if (seen.Count < 1_024 && lastSeenPruneUtc is { } last && now - last < SeenPruneInterval) return;
+        lastSeenPruneUtc = now;
+        foreach (var pair in seen.Where(item => now - item.Value >= SeenRetention).ToArray())
+        {
+            seen.Remove(pair.Key);
+            failedAttempts.Remove(pair.Key);
+        }
     }
 
     private static bool IsRetryable(HttpStatusCode status) =>
@@ -396,7 +472,8 @@ public sealed class IdentityObservationProducer : IDisposable
         Delivered,
         Skipped,
         Throttled,
-        Failed
+        Failed,
+        Rejected
     }
 
     private static TimeSpan Backoff(int attempt) =>

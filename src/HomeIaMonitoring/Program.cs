@@ -28,6 +28,7 @@ builder.Services.AddSingleton<LiveStreamReader>();
 builder.Services.AddSingleton<ClipMediaWriter>();
 builder.Services.AddSingleton<ClipLibrary>();
 builder.Services.AddSingleton<IClipPlaybackSource>(provider => provider.GetRequiredService<ClipLibrary>());
+builder.Services.AddSingleton<ClipFrameSampler>();
 builder.Services.AddSingleton<RosterStore>();
 builder.Services.AddSingleton<BiometricStore>();
 builder.Services.AddSingleton<BiometricRetentionWorker>();
@@ -65,8 +66,10 @@ builder.Services.AddSingleton(provider =>
 builder.Services.AddSingleton(provider =>
     FaceRecognitionOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
 builder.Services.AddSingleton(provider => FaceArtifactVerifier.Verify(provider.GetRequiredService<FaceRecognitionOptions>()));
-builder.Services.AddSingleton<IFaceFrameExtractor>(provider =>
+builder.Services.AddSingleton(provider =>
     new FfmpegFaceFrameExtractor(provider.GetRequiredService<FaceRecognitionOptions>()));
+builder.Services.AddSingleton<IFaceFrameExtractor>(provider =>
+    provider.GetRequiredService<FfmpegFaceFrameExtractor>());
 builder.Services.AddSingleton<IFaceObservationSource>(provider =>
 {
     var source = provider.GetRequiredService<IdentityObservationOptions>().Source;
@@ -81,12 +84,17 @@ builder.Services.AddSingleton<IFaceObservationSource>(provider =>
         options => new SFaceEmbedder(options),
         provider.GetRequiredService<ILogger<OnnxFaceObservationSource>>());
 });
+builder.Services.AddSingleton(provider => new IdentityObservationScanStateStore(
+    Path.Combine(provider.GetRequiredService<MonitoringOptions>().SpoolDirectory,
+        "identity-observations", "scan-state.json"),
+    provider.GetRequiredService<ILogger<IdentityObservationScanStateStore>>()));
 builder.Services.AddSingleton(provider => new IdentityObservationProducer(
     provider.GetRequiredService<IdentityObservationOptions>(),
     provider.GetRequiredService<IClipPlaybackSource>(),
     provider.GetRequiredService<IFaceObservationSource>(),
     provider.GetRequiredService<TimeProvider>(),
-    provider.GetRequiredService<ILogger<IdentityObservationProducer>>()));
+    provider.GetRequiredService<ILogger<IdentityObservationProducer>>(),
+    stateStore: provider.GetRequiredService<IdentityObservationScanStateStore>()));
 builder.Services.AddHostedService(provider => new IdentityObservationWorker(
     provider.GetRequiredService<IdentityObservationProducer>(),
     provider.GetRequiredService<IdentityObservationOptions>(),
@@ -194,6 +202,22 @@ app.MapGet("/api/v1/monitoring/clips/{publicId}/media",
             ? Results.Json(new { error = "clip_playback_unavailable" },
                 statusCode: StatusCodes.Status503ServiceUnavailable)
             : Results.File(path, "video/mp4", enableRangeProcessing: true);
+    });
+app.MapGet("/api/v1/monitoring/clips/{publicId}/frames",
+    async (string publicId, ClipFrameSampler sampler, CancellationToken cancellationToken) =>
+    {
+        var manifest = await sampler.DescribeAsync(publicId, cancellationToken);
+        return manifest is null
+            ? Results.NotFound(new { error = "clip_frames_unavailable" })
+            : Results.Ok(manifest);
+    });
+app.MapGet("/api/v1/monitoring/clips/{publicId}/frames/{index:int}",
+    async (string publicId, int index, ClipFrameSampler sampler, CancellationToken cancellationToken) =>
+    {
+        var jpeg = await sampler.ReadAsync(publicId, index, cancellationToken);
+        return jpeg is null
+            ? Results.NotFound(new { error = "clip_frame_unavailable" })
+            : Results.File(jpeg, "image/jpeg");
     });
 app.MapGet("/api/v1/monitoring/live/{cameraId}/index.m3u8",
     (string cameraId, MonitoringOptions monitoring, CaptureSettingsStore settings, LiveStreamReader live,

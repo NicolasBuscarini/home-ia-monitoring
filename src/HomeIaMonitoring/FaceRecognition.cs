@@ -19,7 +19,8 @@ public sealed record FacePoint(float X, float Y);
 /// <summary>Decoded RGB image kept only in memory for one observation attempt.</summary>
 public sealed record RgbImage(int Width, int Height, byte[] Pixels)
 {
-    public bool IsValid => Width is > 0 and <= 2048 && Height is > 0 and <= 2048 && Pixels.Length == Width * Height * 3;
+    public bool IsValid => Width > 0 && Height > 0 && (long)Width * Height <= 2048L * 2048L &&
+                           (long)Width * Height * 3 == Pixels.Length;
 }
 
 public interface IFaceDetector
@@ -78,7 +79,7 @@ public sealed record FaceRecognitionOptions(
             ReadInt(configuration, "MONITORING_FACE_MAXIMUM_INPUT_SIZE", 640, 64, 1280),
             ReadInt(configuration, "MONITORING_FACE_INTRA_OP_THREADS", 1, 1, 8),
             ReadInt(configuration, "MONITORING_FACE_TIMEOUT_SECONDS", 20, 5, 120),
-            ReadInt(configuration, "MONITORING_FACE_MAXIMUM_FRAMES", 2, 1, 3),
+            ReadInt(configuration, "MONITORING_FACE_MAXIMUM_FRAMES", 6, 1, 12),
             (configuration["MONITORING_CAPTURE_FFMPEG_PATH"] ?? "ffmpeg").Trim());
     }
 
@@ -164,11 +165,20 @@ public sealed class FfmpegFaceFrameExtractor : IFaceFrameExtractor
         if (!File.Exists(mediaPath)) return [];
         var positions = SamplePositions(duration, options.MaximumFrames);
         var frames = new List<RgbImage>(positions.Count);
-        foreach (var position in positions)
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeout.CancelAfter(TimeSpan.FromSeconds(options.TimeoutSeconds));
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var frame = await ReadFrameAsync(mediaPath, position, cancellationToken);
-            if (frame is not null) frames.Add(frame);
+            foreach (var position in positions)
+            {
+                timeout.Token.ThrowIfCancellationRequested();
+                var frame = await ReadFrameAsync(mediaPath, position, timeout.Token);
+                if (frame is not null) frames.Add(frame);
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // The per-clip budget ran out; keep the frames decoded so far.
         }
         return frames;
     }
@@ -176,12 +186,17 @@ public sealed class FfmpegFaceFrameExtractor : IFaceFrameExtractor
     internal static IReadOnlyList<TimeSpan> SamplePositions(TimeSpan duration, int maximumFrames)
     {
         var seconds = duration.TotalSeconds;
-        if (seconds < 1) return [TimeSpan.Zero];
-        if (maximumFrames < 2 || seconds < 3) return [TimeSpan.FromSeconds(seconds / 2)];
-        return [TimeSpan.FromSeconds(seconds * 0.3), TimeSpan.FromSeconds(seconds * 0.7)];
+        if (seconds <= 0) return [TimeSpan.Zero];
+        var count = Math.Clamp(maximumFrames, 1, 12);
+        if (seconds < 1) return [TimeSpan.FromSeconds(seconds / 2)];
+        // Midpoints of equal slices avoid the very start/end (often keyframes or black frames).
+        var positions = new TimeSpan[count];
+        for (var index = 0; index < count; index++)
+            positions[index] = TimeSpan.FromSeconds(seconds * (index + 0.5) / count);
+        return positions;
     }
 
-    private async Task<RgbImage?> ReadFrameAsync(string mediaPath, TimeSpan position,
+    internal async Task<RgbImage?> ReadFrameAsync(string mediaPath, TimeSpan position,
         CancellationToken cancellationToken)
     {
         var start = new ProcessStartInfo(options.FfmpegPath)
@@ -198,16 +213,14 @@ public sealed class FfmpegFaceFrameExtractor : IFaceFrameExtractor
                      "-i", mediaPath, "-frames:v", "1", "-f", "image2pipe", "-c:v", "ppm", "-"
                  })
             start.ArgumentList.Add(argument);
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(TimeSpan.FromSeconds(options.TimeoutSeconds));
         Process? process = null;
         try
         {
             process = Process.Start(start);
             if (process is null) return null;
-            var stderr = process.StandardError.ReadToEndAsync(timeout.Token);
-            var image = await ReadPpmAsync(process.StandardOutput.BaseStream, timeout.Token);
-            await process.WaitForExitAsync(timeout.Token);
+            var stderr = process.StandardError.ReadToEndAsync(cancellationToken);
+            var image = await ReadPpmAsync(process.StandardOutput.BaseStream, cancellationToken);
+            await process.WaitForExitAsync(cancellationToken);
             await stderr;
             if (process.ExitCode != 0) return null;
             return image is { IsValid: true } ? image : null;
@@ -447,15 +460,16 @@ public static class YuNetPostProcess
 public static class FaceAlignment
 {
     public const int OutputSize = 112;
-    private const float ReferenceScale = 112f;
 
+    // Template landmarks in output pixels (0..111). Warp() iterates pixel coordinates, so the reference
+    // must stay in pixel space; normalizing it would invert to coordinates ~112x outside the source image.
     private static readonly FacePoint[] Reference =
     [
-        new(38.2946f / ReferenceScale, 51.6963f / ReferenceScale),
-        new(73.5318f / ReferenceScale, 51.5014f / ReferenceScale),
-        new(56.0252f / ReferenceScale, 71.7366f / ReferenceScale),
-        new(41.5493f / ReferenceScale, 92.3655f / ReferenceScale),
-        new(70.7299f / ReferenceScale, 92.2041f / ReferenceScale)
+        new(38.2946f, 51.6963f),
+        new(73.5318f, 51.5014f),
+        new(56.0252f, 71.7366f),
+        new(41.5493f, 92.3655f),
+        new(70.7299f, 92.2041f)
     ];
 
     public static SimilarityTransform Fit(IReadOnlyList<FacePoint> landmarks)
@@ -635,42 +649,63 @@ public sealed class OnnxFaceObservationSource : IFaceObservationSource, IDisposa
         var path = await playback.GetPlaybackPathAsync(clip.PublicId, cancellationToken);
         if (path is null) return null;
         var sampled = await frames.ExtractAsync(path, clip.Duration ?? TimeSpan.Zero, cancellationToken);
-        foreach (var image in sampled)
+        var selected = SelectBestFace(sampled, detector.Value, options.MinimumFacePixels);
+        if (selected is null) return null;
+        var (image, face) = selected.Value;
+        SimilarityTransform transform;
+        try
         {
-            var face = LargestFace(image);
-            if (face is null || Math.Min(face.Width, face.Height) < options.MinimumFacePixels) continue;
-            SimilarityTransform transform;
-            try
-            {
-                transform = FaceAlignment.Fit(face.Landmarks);
-            }
-            catch (ArgumentException)
-            {
-                continue;
-            }
-            var values = embedder.Value.Embed(FaceAlignment.Warp(image, transform));
-            if (values.Count != FaceRecognitionOptions.EmbeddingDimensions ||
-                values.Any(value => !float.IsFinite(value)))
-            {
-                logger.LogWarning("Embedding facial inválido descartado; tipo={Type}", "invalid_embedding");
-                continue;
-            }
-            return new FaceObservation(ObservationSchemaVersion, FaceRecognitionOptions.ModelId,
-                FaceRecognitionOptions.ModelVersion, EmbeddingSchemaVersion, values.Count, values,
-                clip.CameraId, clip.PublicId, clip.EndedAtUtc);
+            transform = FaceAlignment.Fit(face.Landmarks);
         }
-        return null;
+        catch (ArgumentException)
+        {
+            return null;
+        }
+        var values = embedder.Value.Embed(FaceAlignment.Warp(image, transform));
+        if (values.Count != FaceRecognitionOptions.EmbeddingDimensions ||
+            values.Any(value => !float.IsFinite(value)))
+        {
+            logger.LogWarning("Embedding facial inválido descartado; tipo={Type}", "invalid_embedding");
+            return null;
+        }
+        logger.LogDebug("Observação facial: {Frames} frames, face escolhida {Width}x{Height}",
+            sampled.Count, face.Width, face.Height);
+        return new FaceObservation(ObservationSchemaVersion, FaceRecognitionOptions.ModelId,
+            FaceRecognitionOptions.ModelVersion, EmbeddingSchemaVersion, values.Count, values,
+            clip.CameraId, clip.PublicId, clip.EndedAtUtc);
     }
+
+    /// <summary>
+    /// Picks the largest usable face across all sampled frames, ignoring faces that touch the frame border
+    /// (often partially visible close-ups) or fall below the configured minimum size.
+    /// </summary>
+    internal static (RgbImage Image, DetectedFace Face)? SelectBestFace(IReadOnlyList<RgbImage> frames,
+        IFaceDetector detector, int minimumPixels)
+    {
+        (RgbImage Image, DetectedFace Face)? best = null;
+        var bestArea = 0f;
+        foreach (var image in frames)
+        {
+            foreach (var face in detector.Detect(image))
+            {
+                if (!face.IsValid || Math.Min(face.Width, face.Height) < minimumPixels) continue;
+                if (!LandmarksInside(face, image)) continue;
+                var area = face.Width * face.Height;
+                if (best is not null && area <= bestArea) continue;
+                best = (image, face);
+                bestArea = area;
+            }
+        }
+        return best;
+    }
+
+    private static bool LandmarksInside(DetectedFace face, RgbImage image) =>
+        face.Landmarks.All(point => point.X >= 0 && point.Y >= 0 &&
+                                    point.X <= image.Width - 1 && point.Y <= image.Height - 1);
 
     public void Dispose()
     {
         if (detector.IsValueCreated && detector.Value is IDisposable detectorDisposable) detectorDisposable.Dispose();
         if (embedder.IsValueCreated && embedder.Value is IDisposable embedderDisposable) embedderDisposable.Dispose();
-    }
-
-    private DetectedFace? LargestFace(RgbImage image)
-    {
-        var faces = detector.Value.Detect(image);
-        return faces.Count == 0 ? null : faces.OrderByDescending(face => face.Width * face.Height).First();
     }
 }

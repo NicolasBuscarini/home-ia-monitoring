@@ -41,12 +41,14 @@ Este inventário orienta a extração do runtime de Monitoramento do monólito `
 ## Producer de observação de identidade (T09-PRODUCER, 05/11/2026)
 
 - `IDENTITY_OBSERVATION_PRODUCER_ENABLED=false` por padrão; `..._SOURCE=disabled|synthetic|onnx-yunet-sface` (extração local opcional, ADR124).
-- `onnx-yunet-sface`: até `MONITORING_FACE_MAXIMUM_FRAMES` frames (padrão 2, 30%/70%) via FFmpeg, YuNet/SFace em `/face-models` read-only com SHA-256; estados `not_configured`/`artifact_unavailable`/`artifact_checksum_mismatch` desligam só a observação.
-- Varre clipes `ready` mais recentes, deduplica por `clipPublicId` e limita uma observação por câmera a cada `..._MIN_INTERVAL_SECONDS` (padrão 60).
-- Fila limitada em memória (`..._QUEUE_CAPACITY`, padrão 64): embeddings não são gravados em disco; reinício perde pendências e o descarte é observável.
+- `onnx-yunet-sface`: até `MONITORING_FACE_MAXIMUM_FRAMES` frames (padrão 6, 1..12), distribuídos em pontos médios uniformes do clipe, via FFmpeg; YuNet/SFace em `/face-models` read-only com SHA-256; a melhor face (5 landmarks dentro da imagem) é escolhida entre os frames; estados `not_configured`/`artifact_unavailable`/`artifact_checksum_mismatch` desligam só a observação.
+- Varre o spool em páginas (`ListReadyPageAsync(take, offset)`) sem limite fixo de manifests, deduplica por `clipPublicId`, retenta falhas transitórias até `..._MAX_ATTEMPTS` e limita uma observação por câmera a cada `..._MIN_INTERVAL_SECONDS` (padrão 60).
+- O cursor (`scanOffset`/`sweeps`), o `seen` e as tentativas falhas são persistidos atomicamente em `identity-observations/scan-state.json` no spool (JSON versionado, apenas IDs públicos e timestamps, retenção de 7 dias). Reinício retoma a varredura em vez de recomeçar; arquivo ausente/corrompido é registrado e a varredura reinicia do zero.
+- Verificado em execução em 08/11/2026: após restart, o producer logou `Estado de varredura ... retomado: offset=69, ciclos=0, vistos=64`; o arquivo no spool tinha `schemaVersion=1`, `scanOffset=133` e `seen=110`, sem `.tmp` residual.
+- Fila limitada em memória (`..._QUEUE_CAPACITY`, padrão 64): embeddings nunca são gravados em disco; reinício perde apenas pendências em voo e o descarte é observável.
 - Usa `MONITORING_SERVICE_TOKEN_SECRET` e envia `face-observation.v1` a `IDENTITY_OBSERVATION_PRODUCER_PORTAL_URL/api/v1/monitoring/identity-observations` com escopo `identity.observations.write`.
 - Retry para rede/`408`/`429`/`5xx`; `4xx` definitivo é descartado. Status em `GET /api/v1/monitoring/identity-observations/status`; métricas `home_ia_identity_observations_*` em `/metrics`.
-- Rollback: `..._ENABLED=false` e reinício do serviço; nenhum dado persistido no serviço precisa ser removido.
+- Rollback: `..._ENABLED=false` e reinício do serviço; o estado de varredura pode ser removido (`identity-observations/scan-state.json`) sem afetar clipes, inscrições ou observações já entregues.
 
 ## Regras de migração e rollback
 
