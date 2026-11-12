@@ -42,6 +42,13 @@ O painel administrativo do portal consome esses endpoints por proxy autenticado 
 
 O serviço não autentica usuários e não decide autorização. Ele lê/escreve o spool configurado em `MONITORING_SPOOL_DIRECTORY` (default `/spool`) e usa `MONITORING_STATUS_STALE_SECONDS` (default 20) para classificar status. A exposição direta do serviço é apenas para a rede interna; o portal é a autoridade de sessão/permissão.
 
+## Backup do spool (T11)
+
+- `ISpoolBackupService`/`SpoolBackupService` copia **somente metadados duráveis** do spool — `clips/manifests`, `events` (journal + outbox), `analysis`, `roster`, `retention`, `gaps`, `identity-observations` e `capture-settings.json` — para `MONITORING_BACKUP_DIRECTORY` (default `../backups` ao lado do spool). Nunca copia mídia (`clips/media`, `clips/thumbnails`, `clips/playback`, `segments`), manifestos efêmeros de segmento (`manifests`), o diretório `work` nem biometria cifrada (`biometrics`, fora de backup por ADR072).
+- Cada arquivo é copiado com SHA-256 e descrito em `manifest.json` (escrita atômica) com integridade própria; `CreateAsync` devolve `{ directoryName, createdAtUtc, sizeBytes, sha256, fileCount }` e `ListAsync` lista até 50 artefatos. `RestoreAsync` re-verifica o hash de cada arquivo e restaura para um diretório isolado (nunca o spool ativo); falha fechado com hash divergente, arquivo/manifesto ausente ou destino já existente.
+- Restore real sobre o spool ativo é procedimento do operador com o serviço parado; a cifra dos backups e a cópia para destino independente (NAS) permanecem pendências compartilhadas com o backup do portal.
+- Agendamento opcional (`SpoolBackupSchedulerWorker`), desativado por padrão: `MONITORING_BACKUP_SCHEDULE_ENABLED` (default `false`), `MONITORING_BACKUP_SCHEDULE_INTERVAL_HOURS` (default 24, 1–168) e `MONITORING_BACKUP_SCHEDULE_RETENTION_COUNT` (default 14, 1–100). Quando ativo, cada ciclo cria um artefato e remove os mais antigos além da retenção (`DeleteAsync`, idempotente).
+
 ## Captura (`T16-C-B-B-B`)
 
 - `MONITORING_CAPTURE_ENABLED=false` é o default de bootstrap. A captura só inicia quando habilitada pelo ambiente ou pela API de settings.

@@ -38,6 +38,12 @@ builder.Services.AddSingleton<RetentionStore>();
 builder.Services.AddSingleton<ClipRetentionWorker>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<ClipRetentionWorker>());
 builder.Services.AddSingleton<EventJournal>();
+builder.Services.AddSingleton<ISpoolBackupService, SpoolBackupService>();
+builder.Services.AddSingleton(provider =>
+    SpoolBackupScheduleOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
+builder.Services.AddSingleton<SpoolBackupSchedulerService>();
+builder.Services.AddSingleton<SpoolBackupSchedulerWorker>();
+builder.Services.AddHostedService(provider => provider.GetRequiredService<SpoolBackupSchedulerWorker>());
 builder.Services.AddSingleton<AnalysisDispatchStore>();
 builder.Services.AddSingleton(provider =>
     AnalysisRuntimeOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
