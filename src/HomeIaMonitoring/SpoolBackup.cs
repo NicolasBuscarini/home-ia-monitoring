@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -81,14 +82,16 @@ public sealed class SpoolBackupService : ISpoolBackupService
     private readonly string backupDirectory;
     private readonly TimeProvider timeProvider;
     private readonly IBackupArtifactProtector protector;
+    private readonly SpoolBackupMetrics metrics;
     private readonly ILogger<SpoolBackupService> logger;
 
     public SpoolBackupService(MonitoringOptions monitoring, IConfiguration configuration,
         TimeProvider timeProvider, IBackupArtifactProtector protector,
-        ILogger<SpoolBackupService> logger)
+        SpoolBackupMetrics metrics, ILogger<SpoolBackupService> logger)
     {
         this.timeProvider = timeProvider;
         this.protector = protector;
+        this.metrics = metrics;
         this.logger = logger;
         spoolDirectory = monitoring.SpoolDirectory;
         var configured = configuration[BackupDirectoryKey];
@@ -108,13 +111,17 @@ public sealed class SpoolBackupService : ISpoolBackupService
     public async Task<SpoolBackupArtifact> CreateAsync(CancellationToken cancellationToken)
     {
         if (!protector.IsConfigured)
+        {
+            metrics.Failed(timeProvider.GetUtcNow());
             throw new InvalidOperationException(
                 "Cifra de backup indisponível: configure MONITORING_BACKUP_ENCRYPTION_KEY e MONITORING_BACKUP_ENCRYPTION_KEY_VERSION.");
+        }
         Directory.CreateDirectory(backupDirectory);
         var createdAtUtc = timeProvider.GetUtcNow();
         var directoryName = ResolveBackupDirectoryName(createdAtUtc);
         var targetDirectory = Path.Combine(backupDirectory, directoryName);
         var entries = new List<SpoolBackupEntry>();
+        var stopwatch = Stopwatch.StartNew();
         try
         {
             Directory.CreateDirectory(targetDirectory);
@@ -136,6 +143,8 @@ public sealed class SpoolBackupService : ISpoolBackupService
                 integritySha256, entries.ToArray(),
                 new SpoolBackupEncryption("aes-256-gcm", protector.ActiveKeyVersion!));
             await WriteManifestAsync(targetDirectory, manifest, cancellationToken);
+            metrics.Created(totalBytes, createdAtUtc);
+            metrics.ObservedDuration(stopwatch.Elapsed);
             logger.LogInformation(
                 "Backup do spool criado (cifrado, chave {KeyVersion}): {DirectoryName} ({FileCount} arquivos, {SizeBytes} bytes, sha256 {Sha256}).",
                 protector.ActiveKeyVersion, directoryName, entries.Count, totalBytes, integritySha256);
@@ -143,6 +152,7 @@ public sealed class SpoolBackupService : ISpoolBackupService
         }
         catch
         {
+            metrics.Failed(timeProvider.GetUtcNow());
             if (Directory.Exists(targetDirectory)) Directory.Delete(targetDirectory, recursive: true);
             throw;
         }
@@ -224,6 +234,7 @@ public sealed class SpoolBackupService : ISpoolBackupService
         if (Directory.Exists(target))
         {
             Directory.Delete(target, recursive: true);
+            metrics.Deleted();
             logger.LogInformation("Backup do spool removido: {DirectoryName}.", directoryName);
         }
         return Task.CompletedTask;

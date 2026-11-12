@@ -131,6 +131,24 @@ public sealed class SpoolBackupTests
                 CancellationToken.None));
     }
 
+    [Fact]
+    public void Metrics_render_backup_counters_after_create_and_failure()
+    {
+        var metrics = new SpoolBackupMetrics();
+        metrics.Created(2048, DateTimeOffset.FromUnixTimeSeconds(1_700_000_000));
+        metrics.ObservedDuration(TimeSpan.FromMilliseconds(80));
+        var failureAt = DateTimeOffset.FromUnixTimeSeconds(1_700_000_100);
+        metrics.Failed(failureAt);
+        metrics.Deleted();
+
+        var rendered = metrics.Render();
+        Assert.Contains("monitoring_backup_created_total", rendered);
+        Assert.Contains("monitoring_backup_failed_total", rendered);
+        Assert.Contains("monitoring_backup_deleted_total", rendered);
+        Assert.Contains("monitoring_backup_last_success_size_bytes 2048", rendered);
+        Assert.Equal(failureAt, metrics.LastFailureAtUtc);
+    }
+
     private static void WriteMetadata(string spool)
     {
         Write(spool, "clips/manifests/clip.json", """{"schemaVersion":"1.0","clipId":"clip-1"}""");
@@ -169,7 +187,7 @@ public sealed class SpoolBackupTests
         var protector = new AesGcmBackupArtifactProtector(configuration,
             NullLogger<AesGcmBackupArtifactProtector>.Instance);
         return new SpoolBackupService(monitoring, configuration, TimeProvider.System, protector,
-            NullLogger<SpoolBackupService>.Instance);
+            new SpoolBackupMetrics(), NullLogger<SpoolBackupService>.Instance);
     }
 
     private sealed class TempSpool : IDisposable

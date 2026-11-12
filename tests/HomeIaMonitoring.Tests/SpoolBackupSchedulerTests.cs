@@ -80,7 +80,7 @@ public sealed class SpoolBackupSchedulerTests
         var protector = new AesGcmBackupArtifactProtector(configuration,
             NullLogger<AesGcmBackupArtifactProtector>.Instance);
         return new SpoolBackupService(monitoring, configuration, TimeProvider.System, protector,
-            NullLogger<SpoolBackupService>.Instance);
+            new SpoolBackupMetrics(), NullLogger<SpoolBackupService>.Instance);
     }
 
     private sealed class TempSpool : IDisposable

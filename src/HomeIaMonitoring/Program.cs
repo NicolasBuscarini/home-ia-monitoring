@@ -39,11 +39,13 @@ builder.Services.AddSingleton<ClipRetentionWorker>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<ClipRetentionWorker>());
 builder.Services.AddSingleton<EventJournal>();
 builder.Services.AddSingleton<IBackupArtifactProtector, AesGcmBackupArtifactProtector>();
+builder.Services.AddSingleton<SpoolBackupMetrics>();
 builder.Services.AddSingleton<ISpoolBackupService, SpoolBackupService>();
 builder.Services.AddSingleton(provider =>
     SpoolBackupScheduleOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));
 builder.Services.AddSingleton<SpoolBackupSchedulerService>();
 builder.Services.AddSingleton<SpoolBackupSchedulerWorker>();
+builder.Services.AddSingleton<SpoolReconciler>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<SpoolBackupSchedulerWorker>());
 builder.Services.AddSingleton<AnalysisDispatchStore>();
 builder.Services.AddSingleton(provider =>
@@ -490,9 +492,13 @@ app.MapGet("/api/v1/monitoring/events/outbox",
 app.MapGet("/api/v1/monitoring/identity-observations/status",
     (IdentityObservationProducer producer) => Results.Ok(producer.GetStatus()));
 app.MapGet("/metrics",
-    (PlatformEventOutbox outbox, IdentityObservationProducer producer) =>
+    (PlatformEventOutbox outbox, IdentityObservationProducer producer, SpoolBackupMetrics backups) =>
         Results.Text(EventOutboxMetrics.Render(outbox.GetStatus()) +
-            IdentityObservationMetrics.Render(producer.GetStatus()), EventOutboxMetrics.ContentType));
+            IdentityObservationMetrics.Render(producer.GetStatus()) +
+            backups.Render(), EventOutboxMetrics.ContentType));
+app.MapGet("/api/v1/monitoring/spool/reconciliation",
+    async (SpoolReconciler reconciler, CancellationToken cancellationToken) =>
+        Results.Ok(await reconciler.ReconcileAsync(cancellationToken)));
 app.MapGet("/api/v1/monitoring/analysis/policies/{cameraId}",
     async (string cameraId, AnalysisDispatchStore store, CancellationToken cancellationToken) =>
     {
