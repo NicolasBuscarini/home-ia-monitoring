@@ -7,6 +7,9 @@ namespace HomeIaMonitoring.Tests;
 
 public sealed class SpoolBackupTests
 {
+    private const string TestKeyBase64 = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
+    private const string TestKeyVersion = "test-1";
+
     [Fact]
     public async Task Backup_copies_only_durable_metadata_and_restores_it_into_an_isolated_directory()
     {
@@ -28,6 +31,11 @@ public sealed class SpoolBackupTests
         Assert.True(File.Exists(Path.Combine(backupRoot, "events/event.json")));
         Assert.True(File.Exists(Path.Combine(backupRoot, "analysis/results/result.json")));
         Assert.True(File.Exists(Path.Combine(backupRoot, "capture-settings.json")));
+
+        // Backed-up files are sealed ciphertext, not plaintext JSON.
+        var backedUpClip = await File.ReadAllTextAsync(
+            Path.Combine(backupRoot, "clips/manifests/clip.json"));
+        Assert.DoesNotContain("clipId", backedUpClip);
 
         // Media and ephemeral capture state must not be backed up.
         Assert.False(File.Exists(Path.Combine(backupRoot, "clips/media/clip.ts")));
@@ -51,6 +59,42 @@ public sealed class SpoolBackupTests
         Assert.True(File.Exists(Path.Combine(targetDirectory, "events/event.json")));
         Assert.True(File.Exists(Path.Combine(targetDirectory, "analysis/results/result.json")));
         Assert.False(File.Exists(Path.Combine(targetDirectory, "clips/media/clip.ts")));
+
+        // The restored file is the decrypted plaintext again.
+        var restoredClip = await File.ReadAllTextAsync(
+            Path.Combine(targetDirectory, "clips/manifests/clip.json"));
+        Assert.Contains("clipId", restoredClip);
+    }
+
+    [Fact]
+    public async Task Create_refuses_when_the_encryption_key_is_absent()
+    {
+        using var spool = new TempSpool();
+        WriteMetadata(spool.Path);
+
+        var backupDirectory = Path.Combine(spool.Root, "backups");
+        var service = CreateService(spool.Path, backupDirectory, keyBase64: null, keyVersion: null);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.CreateAsync(CancellationToken.None));
+        Assert.Empty(await service.ListAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Restore_refuses_when_the_configured_key_version_diverges()
+    {
+        using var spool = new TempSpool();
+        WriteMetadata(spool.Path);
+
+        var backupDirectory = Path.Combine(spool.Root, "backups");
+        var service = CreateService(spool.Path, backupDirectory);
+        var artifact = await service.CreateAsync(CancellationToken.None);
+
+        var other = CreateService(spool.Path, backupDirectory, TestKeyBase64, "test-2");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            other.RestoreAsync(artifact.DirectoryName, Path.Combine(spool.Root, "restored"),
+                CancellationToken.None));
     }
 
     [Fact]
@@ -108,16 +152,23 @@ public sealed class SpoolBackupTests
         File.WriteAllText(path, content);
     }
 
-    private static SpoolBackupService CreateService(string spool, string backupDirectory)
+    private static SpoolBackupService CreateService(string spool, string backupDirectory) =>
+        CreateService(spool, backupDirectory, TestKeyBase64, TestKeyVersion);
+
+    private static SpoolBackupService CreateService(string spool, string backupDirectory,
+        string? keyBase64, string? keyVersion)
     {
         var monitoring = new MonitoringOptions("garage-01", spool, 20);
-        var configuration = new ConfigurationBuilder()
-            .AddInMemoryCollection(new Dictionary<string, string?>
-            {
-                [SpoolBackupService.BackupDirectoryKey] = backupDirectory
-            })
-            .Build();
-        return new SpoolBackupService(monitoring, configuration, TimeProvider.System,
+        var values = new Dictionary<string, string?>
+        {
+            [SpoolBackupService.BackupDirectoryKey] = backupDirectory
+        };
+        if (keyBase64 is not null) values[AesGcmBackupArtifactProtector.KeySetting] = keyBase64;
+        if (keyVersion is not null) values[AesGcmBackupArtifactProtector.KeyVersionSetting] = keyVersion;
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(values).Build();
+        var protector = new AesGcmBackupArtifactProtector(configuration,
+            NullLogger<AesGcmBackupArtifactProtector>.Instance);
+        return new SpoolBackupService(monitoring, configuration, TimeProvider.System, protector,
             NullLogger<SpoolBackupService>.Instance);
     }
 

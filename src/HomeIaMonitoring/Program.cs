@@ -38,6 +38,7 @@ builder.Services.AddSingleton<RetentionStore>();
 builder.Services.AddSingleton<ClipRetentionWorker>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<ClipRetentionWorker>());
 builder.Services.AddSingleton<EventJournal>();
+builder.Services.AddSingleton<IBackupArtifactProtector, AesGcmBackupArtifactProtector>();
 builder.Services.AddSingleton<ISpoolBackupService, SpoolBackupService>();
 builder.Services.AddSingleton(provider =>
     SpoolBackupScheduleOptions.FromConfiguration(provider.GetRequiredService<IConfiguration>()));

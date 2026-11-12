@@ -48,8 +48,10 @@ public sealed class SpoolBackupService : ISpoolBackupService
     public const string BackupDirectoryKey = "MONITORING_BACKUP_DIRECTORY";
 
     private const string ManifestFileName = "manifest.json";
-    private const int ManifestSchemaVersion = 1;
+    private const int ManifestSchemaVersion = 2;
     private const int MaximumListedArtifacts = 50;
+    private const int NonceBytes = 12;
+    private const int TagBytes = 16;
 
     /// <summary>
     /// Relative spool directories holding durable metadata. Media (<c>clips/media</c>,
@@ -78,12 +80,15 @@ public sealed class SpoolBackupService : ISpoolBackupService
     private readonly string spoolDirectory;
     private readonly string backupDirectory;
     private readonly TimeProvider timeProvider;
+    private readonly IBackupArtifactProtector protector;
     private readonly ILogger<SpoolBackupService> logger;
 
     public SpoolBackupService(MonitoringOptions monitoring, IConfiguration configuration,
-        TimeProvider timeProvider, ILogger<SpoolBackupService> logger)
+        TimeProvider timeProvider, IBackupArtifactProtector protector,
+        ILogger<SpoolBackupService> logger)
     {
         this.timeProvider = timeProvider;
+        this.protector = protector;
         this.logger = logger;
         spoolDirectory = monitoring.SpoolDirectory;
         var configured = configuration[BackupDirectoryKey];
@@ -102,6 +107,9 @@ public sealed class SpoolBackupService : ISpoolBackupService
 
     public async Task<SpoolBackupArtifact> CreateAsync(CancellationToken cancellationToken)
     {
+        if (!protector.IsConfigured)
+            throw new InvalidOperationException(
+                "Cifra de backup indisponível: configure MONITORING_BACKUP_ENCRYPTION_KEY e MONITORING_BACKUP_ENCRYPTION_KEY_VERSION.");
         Directory.CreateDirectory(backupDirectory);
         var createdAtUtc = timeProvider.GetUtcNow();
         var directoryName = ResolveBackupDirectoryName(createdAtUtc);
@@ -117,19 +125,20 @@ public sealed class SpoolBackupService : ISpoolBackupService
                 var source = Path.Combine(spoolDirectory, relative);
                 var destination = Path.Combine(targetDirectory, relative);
                 Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-                var sha256 = await CopyAndHashAsync(source, destination, cancellationToken);
-                var size = new FileInfo(destination).Length;
+                var (plainSha256, cipherSha256, size) = await SealAndHashAsync(source, destination,
+                    cancellationToken);
                 totalBytes += size;
-                entries.Add(new SpoolBackupEntry(relative, size, sha256));
+                entries.Add(new SpoolBackupEntry(relative, size, plainSha256, cipherSha256));
             }
 
             var integritySha256 = ComputeIntegrityHash(entries);
             var manifest = new SpoolBackupManifest(ManifestSchemaVersion, directoryName, createdAtUtc,
-                integritySha256, entries.ToArray());
+                integritySha256, entries.ToArray(),
+                new SpoolBackupEncryption("aes-256-gcm", protector.ActiveKeyVersion!));
             await WriteManifestAsync(targetDirectory, manifest, cancellationToken);
             logger.LogInformation(
-                "Backup do spool criado: {DirectoryName} ({FileCount} arquivos, {SizeBytes} bytes, sha256 {Sha256}).",
-                directoryName, entries.Count, totalBytes, integritySha256);
+                "Backup do spool criado (cifrado, chave {KeyVersion}): {DirectoryName} ({FileCount} arquivos, {SizeBytes} bytes, sha256 {Sha256}).",
+                protector.ActiveKeyVersion, directoryName, entries.Count, totalBytes, integritySha256);
             return new SpoolBackupArtifact(directoryName, createdAtUtc, totalBytes, integritySha256, entries.Count);
         }
         catch
@@ -180,18 +189,19 @@ public sealed class SpoolBackupService : ISpoolBackupService
             var source = Path.Combine(sourceDirectory, entry.RelativePath);
             if (!File.Exists(source))
                 throw new InvalidOperationException($"Arquivo de backup ausente: {entry.RelativePath}.");
-            var sourceHash = await HashFileAsync(source, cancellationToken);
-            if (!string.Equals(sourceHash, entry.Sha256, StringComparison.OrdinalIgnoreCase))
+
+            var plaintext = manifest.Encryption is null
+                ? await File.ReadAllBytesAsync(source, cancellationToken)
+                : await DecryptFileAsync(source, entry, manifest.Encryption, cancellationToken);
+            var plainSha256 = Convert.ToHexString(SHA256.HashData(plaintext)).ToLowerInvariant();
+            if (!string.Equals(plainSha256, entry.Sha256, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException($"Arquivo de backup não confere com o SHA-256 do manifesto: {entry.RelativePath}.");
 
             var destination = Path.Combine(targetDirectory, entry.RelativePath);
             if (File.Exists(destination))
                 throw new InvalidOperationException($"O destino do restore já existe: {destination}.");
             Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-            File.Copy(source, destination, overwrite: false);
-            var restoredHash = await HashFileAsync(destination, cancellationToken);
-            if (!string.Equals(restoredHash, entry.Sha256, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException($"Cópia restaurada não confere com o SHA-256: {entry.RelativePath}.");
+            await File.WriteAllBytesAsync(destination, plaintext, cancellationToken);
             totalBytes += entry.SizeBytes;
         }
 
@@ -278,14 +288,37 @@ public sealed class SpoolBackupService : ISpoolBackupService
         File.Move(temporaryPath, manifestPath, true);
     }
 
-    private static async Task<string> CopyAndHashAsync(string source, string destination,
-        CancellationToken cancellationToken)
+    private async Task<(string plainSha256, string cipherSha256, long size)> SealAndHashAsync(
+        string source, string destination, CancellationToken cancellationToken)
     {
-        await using (var input = File.OpenRead(source))
+        var plaintext = await File.ReadAllBytesAsync(source, cancellationToken);
+        var size = plaintext.Length;
+        var plainSha256 = Convert.ToHexString(SHA256.HashData(plaintext)).ToLowerInvariant();
+        var envelope = protector.Seal(plaintext);
         await using (var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write,
                            FileShare.None, 81920, true))
-            await input.CopyToAsync(output, cancellationToken);
-        return await HashFileAsync(destination, cancellationToken);
+        {
+            await output.WriteAsync(envelope.Nonce, cancellationToken);
+            await output.WriteAsync(envelope.Ciphertext, cancellationToken);
+            await output.WriteAsync(envelope.Tag, cancellationToken);
+        }
+        var cipherSha256 = await HashFileAsync(destination, cancellationToken);
+        return (plainSha256, cipherSha256, size);
+    }
+
+    private async Task<byte[]> DecryptFileAsync(string path, SpoolBackupEntry entry,
+        SpoolBackupEncryption encryption, CancellationToken cancellationToken)
+    {
+        var artifactBytes = await File.ReadAllBytesAsync(path, cancellationToken);
+        var cipherSha256 = Convert.ToHexString(SHA256.HashData(artifactBytes)).ToLowerInvariant();
+        if (!string.Equals(cipherSha256, entry.CipherSha256, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException($"Artefato cifrado não confere com o SHA-256 do manifesto: {entry.RelativePath}.");
+        if (artifactBytes.Length < NonceBytes + TagBytes)
+            throw new InvalidOperationException($"Artefato cifrado inválido: {entry.RelativePath}.");
+        var nonce = artifactBytes.AsSpan(0, NonceBytes).ToArray();
+        var tag = artifactBytes.AsSpan(artifactBytes.Length - TagBytes).ToArray();
+        var ciphertext = artifactBytes.AsSpan(NonceBytes, artifactBytes.Length - NonceBytes - TagBytes).ToArray();
+        return protector.Open(new EncryptedBackupEnvelope(nonce, ciphertext, tag), encryption.KeyVersion);
     }
 
     private static async Task<string> HashFileAsync(string path, CancellationToken cancellationToken)
@@ -298,16 +331,24 @@ public sealed class SpoolBackupService : ISpoolBackupService
     {
         var builder = new StringBuilder();
         foreach (var entry in entries.OrderBy(item => item.RelativePath, StringComparer.Ordinal))
+        {
             builder.Append(entry.RelativePath).Append('|').Append(entry.SizeBytes).Append('|')
-                .Append(entry.Sha256).Append('\n');
+                .Append(entry.Sha256);
+            if (entry.CipherSha256 is not null)
+                builder.Append('|').Append(entry.CipherSha256);
+            builder.Append('\n');
+        }
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(builder.ToString())))
             .ToLowerInvariant();
     }
 
     private static string Normalize(string path) => path.Replace(Path.DirectorySeparatorChar, '/');
 
-    private sealed record SpoolBackupEntry(string RelativePath, long SizeBytes, string Sha256);
+    private sealed record SpoolBackupEntry(string RelativePath, long SizeBytes, string Sha256,
+        string? CipherSha256 = null);
 
     private sealed record SpoolBackupManifest(int Schema, string DirectoryName, DateTimeOffset CreatedAtUtc,
-        string IntegritySha256, SpoolBackupEntry[] Entries);
+        string IntegritySha256, SpoolBackupEntry[] Entries, SpoolBackupEncryption? Encryption = null);
+
+    private sealed record SpoolBackupEncryption(string Algorithm, string KeyVersion);
 }
