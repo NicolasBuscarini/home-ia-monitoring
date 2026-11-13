@@ -30,33 +30,48 @@ public sealed class ClipFrameSampler(ClipLibrary library, FfmpegFaceFrameExtract
     private const int RenderWidth = 960;
     private readonly Lazy<IFaceDetector> detector =
         new(() => new YuNetFaceDetector(options), LazyThreadSafetyMode.ExecutionAndPublication);
+    private readonly ClipFrameCache _cache = new();
 
     public async Task<ClipFrameManifest?> DescribeAsync(string publicId, CancellationToken cancellationToken)
     {
+        if (_cache.TryGetManifest(publicId, out var cached)) return cached;
+        var (manifest, cacheable) = await ComputeManifestAsync(publicId, cancellationToken);
+        if (manifest is not null && cacheable) _cache.SetManifest(publicId, manifest);
+        return manifest;
+    }
+
+    private async Task<(ClipFrameManifest? Manifest, bool Cacheable)> ComputeManifestAsync(string publicId,
+        CancellationToken cancellationToken)
+    {
         var clip = await library.GetAsync(publicId, cancellationToken);
-        if (clip is null) return null;
+        if (clip is null) return (null, false);
         var manifest = BuildManifest(clip.PublicId, clip.EndedAtUtc - clip.StartedAtUtc, options.MaximumFrames);
-        if (!status.Ready || manifest.Frames.Count == 0) return manifest;
+        if (!status.Ready || manifest.Frames.Count == 0) return (manifest, false);
         var path = await library.GetPlaybackPathAsync(publicId, cancellationToken);
-        if (path is null) return manifest;
+        if (path is null) return (manifest, false);
         var faces = await DetectFacesAsync(path, manifest, cancellationToken);
-        return manifest with
+        if (faces is null) return (manifest, false);
+        var withFaces = manifest with
         {
             Frames = manifest.Frames
                 .Select(frame => frame with { Faces = faces.TryGetValue(frame.Index, out var face) ? [face] : [] })
                 .ToArray()
         };
+        return (withFaces, true);
     }
 
     public async Task<byte[]?> ReadAsync(string publicId, int index, CancellationToken cancellationToken)
     {
         if (index < 0 || index >= MaximumSampledFrames) return null;
+        if (_cache.TryGetFrame(publicId, index, out var cached)) return cached;
         var manifest = await DescribeAsync(publicId, cancellationToken);
         if (manifest is null || index >= manifest.Frames.Count) return null;
         var path = await library.GetPlaybackPathAsync(publicId, cancellationToken);
         if (path is null) return null;
-        return await RenderAsync(path, TimeSpan.FromMilliseconds(manifest.Frames[index].OffsetMilliseconds),
+        var jpeg = await RenderAsync(path, TimeSpan.FromMilliseconds(manifest.Frames[index].OffsetMilliseconds),
             cancellationToken);
+        if (jpeg is not null) _cache.SetFrame(publicId, index, jpeg);
+        return jpeg;
     }
 
     internal static ClipFrameManifest BuildManifest(string publicId, TimeSpan duration, int maximumFrames)
@@ -72,7 +87,7 @@ public sealed class ClipFrameSampler(ClipLibrary library, FfmpegFaceFrameExtract
     /// tell what is being validated. Detection uses the same YuNet model and minimum size as the
     /// producer and never leaves the frame in memory.
     /// </summary>
-    private async Task<Dictionary<int, ClipFrameFace>> DetectFacesAsync(string mediaPath,
+    private async Task<Dictionary<int, ClipFrameFace>?> DetectFacesAsync(string mediaPath,
         ClipFrameManifest manifest, CancellationToken cancellationToken)
     {
         var faces = new Dictionary<int, ClipFrameFace>();
@@ -98,6 +113,7 @@ public sealed class ClipFrameSampler(ClipLibrary library, FfmpegFaceFrameExtract
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             logger.LogWarning("Detecção de rostos nos frames excedeu o orçamento; tipo={Type}", "frame_face_timeout");
+            return null;
         }
         return faces;
     }
